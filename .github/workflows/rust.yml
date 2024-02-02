@@ -27,7 +27,7 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@1.71
 
-      - name: Install cargo-nextest 
+      - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -71,13 +71,16 @@ jobs:
           echo "VK_DRIVER_FILES=$PWD/mesa/lvp_icd.x86_64.json" >> "$GITHUB_ENV"
           echo "GALLIUM_DRIVER=llvmpipe" >> "$GITHUB_ENV"
 
-      - name: Setup python 
+      - name: Setup python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10.6'
-          cache: 'pip'
+          python-version: "3.10.6"
+          cache: "pip"
       - run: pip install -r requirements.txt
 
+      - name: ensure wasm build
+        run: |
+          cargo build --target wasm32-unknown-unknown
       - name: run tests
         shell: bash
         run: |
