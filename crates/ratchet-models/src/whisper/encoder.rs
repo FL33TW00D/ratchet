@@ -150,11 +150,12 @@ mod tests {
         assert_eq!(gg_disk.tensors.len(), 167);
 
         let device = Device::request_device(DeviceRequest::GPU).unwrap();
-        let encoder = WhisperEncoder::load(&gg_disk, &mut reader, &device)?;
         let input = Tensor::from_npy_path::<f32, _>(input_npy, &device)?;
-
+        let start_time = std::time::Instant::now();
+        let encoder = WhisperEncoder::load(&gg_disk, &mut reader, &device)?;
         let result = encoder.forward(&input)?.resolve()?;
         let ours = result.to(&Device::CPU)?;
+        println!("Elapsed: {:?}", start_time.elapsed());
         let ground = Tensor::from_npy_path::<f32, _>(ground_npy, &Device::CPU)?;
         println!("OURS: {:#?}", ours);
         println!("Ground: {:#?}", ground);

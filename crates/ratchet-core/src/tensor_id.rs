@@ -1,5 +1,5 @@
 /// Unique identifier for tensors.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TensorId(usize);
 
 impl std::fmt::Debug for TensorId {

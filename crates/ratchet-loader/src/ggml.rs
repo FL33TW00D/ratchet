@@ -3,6 +3,7 @@ use derive_new::new;
 use half::f16;
 use ratchet::{DType, Device, Shape, Tensor};
 use std::{
+    cell::Cell,
     collections::HashMap,
     io::{BufRead, Seek, SeekFrom},
     mem::MaybeUninit,
@@ -110,13 +111,22 @@ impl TensorHeader {
     }
 }
 
-#[derive(Debug, new)]
+#[derive(Debug)]
 pub struct GGMLModel<M: GGMLCompatible> {
     pub header: M::ModelHeader,
     pub tensors: HashMap<String, TensorHeader>,
+    pub total_loaded: Cell<usize>,
 }
 
 impl<M: GGMLCompatible> GGMLModel<M> {
+    pub fn new(header: M::ModelHeader, tensors: HashMap<String, TensorHeader>) -> Self {
+        Self {
+            header,
+            tensors,
+            total_loaded: 0.into(),
+        }
+    }
+
     pub fn load_tensor<R: BufRead + Seek>(
         &self,
         key: &str,
@@ -138,6 +148,8 @@ impl<M: GGMLCompatible> GGMLModel<M> {
             data = bytemuck::cast_slice::<f32, u8>(&f32_data).to_vec();
             dt = DType::F32;
         }
+        self.total_loaded.set(self.total_loaded.get() + data.len());
+        log::info!("Total loaded: {} bytes", self.total_loaded.get());
         Ok(Tensor::from_bytes(&data, dt, shape, device.clone()).unwrap())
     }
 }

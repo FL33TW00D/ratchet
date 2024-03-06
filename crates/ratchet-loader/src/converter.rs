@@ -18,7 +18,7 @@ impl Converter {
         to_pad: HashMap<&str, Vec<[usize; 2]>>,
     ) -> anyhow::Result<()> {
         let mut reader = std::io::BufReader::new(std::fs::File::open(src_path).unwrap());
-        let src = M::load_ggml(&mut reader)?;
+        let mut src = M::load_ggml(&mut reader)?;
 
         let mut writer = std::io::BufWriter::new(std::fs::File::create(dst_path)?);
         M::write_header(&src.header, &mut writer)?;

@@ -697,9 +697,11 @@ impl Tensor {
                 compiled_ops.push(compiled_op);
             }
         }
-        let _last = execution_order.last().unwrap();
         #[cfg(feature = "plotting")]
-        crate::plot::render_to_file(last, "allocations.svg").unwrap();
+        {
+            let last = execution_order.last().unwrap();
+            crate::plot::render_to_file(last, "allocations.svg").unwrap();
+        }
 
         let executable = Executable::new(compiled_ops, uniform.into_gpu(device)?);
         let index = executable.dispatch_operations(device).unwrap();
