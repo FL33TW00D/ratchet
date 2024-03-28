@@ -15,4 +15,12 @@ thiserror.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+wasm-bindgen-test.workspace = true
 hf-hub.workspace = true
+tokio = { version = "1.36.0", features = [
+    "sync",
+    "macros",
+    "io-util",
+    "rt",
+    "time",
+] }

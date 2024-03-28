@@ -8,6 +8,11 @@ use crate::{
     rvec, RVec,
 };
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum GGUFDType {
+    Q4K,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Hash)]
 pub enum DType {
     Q8,
@@ -18,6 +23,7 @@ pub enum DType {
     I32,
     U32,
     WQ8, //Packed Q8 (|--4xQ8(u32)--| |--f32--|)
+    GGUF(GGUFDType),
 }
 
 impl DType {
@@ -40,6 +46,7 @@ impl DType {
             DType::I32 => 4,
             DType::U32 => 4,
             DType::WQ8 => 4,
+            DType::GGUF(_) => todo!(),
         }
     }
 

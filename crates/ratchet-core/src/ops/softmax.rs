@@ -43,6 +43,10 @@ impl Operation for Softmax {
 }
 
 impl MetaOperation for Softmax {
+    fn kernel_name(&self) -> String {
+        "softmax".to_string()
+    }
+
     fn supports_inplace(&self) -> bool {
         true
     }
@@ -51,7 +55,7 @@ impl MetaOperation for Softmax {
         rvec![&self.input]
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, _: bool, dst: &Tensor) -> String {
         format!("softmax_{}", self.kernel_element(dst).as_str())
     }
 

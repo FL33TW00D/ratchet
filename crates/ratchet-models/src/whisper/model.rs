@@ -2,7 +2,8 @@ use std::io::{BufRead, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ratchet::{shape, Device, Tensor};
-use ratchet_loader::{GGMLCompatible, GGMLFormat, GGMLModel, LoadError};
+use ratchet_loader::ggml::{GGMLCompatible, GGMLFormat, GGMLModel};
+use ratchet_loader::LoadError;
 use ratchet_nn::Module;
 
 use ndarray::{s, Dimension};
@@ -279,7 +280,7 @@ mod tests {
 
     use hf_hub::api::sync::Api;
     use ratchet::{Device, DeviceRequest, Quantization};
-    use ratchet_loader::{Converter, GGMLCompatible};
+    use ratchet_loader::{ggml::GGMLCompatible, Converter};
 
     use crate::{
         model::Whisper, options::DecodingOptionsBuilder, transcript::StreamedSegment,

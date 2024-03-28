@@ -50,11 +50,15 @@ impl OpGuards for IndexSelect {
 }
 
 impl MetaOperation for IndexSelect {
+    fn kernel_name(&self) -> String {
+        "index_select".to_string()
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         rvec![&self.input, &self.indices]
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, _: bool, dst: &Tensor) -> String {
         let op_key = match (self.input.dt(), self.dim) {
             (DType::F32, _) => "f32_index_select",
             (DType::WQ8, 0) => "wq8_index_select",

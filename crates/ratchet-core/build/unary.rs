@@ -41,24 +41,31 @@ impl std::fmt::Display for UnaryOp {
 
 impl Generate for UnaryOp {
     fn generate(renderer: &mut KernelRenderer) -> anyhow::Result<()> {
-        for func in UnaryOp::iter() {
-            for ke in KernelElement::iter() {
-                let path = renderer.templates_path.join("unary.wgsl");
-                renderer.tera.add_template_file(path, Some("unary"))?;
+        for inplace in [true, false].iter() {
+            for func in UnaryOp::iter() {
+                for ke in KernelElement::iter() {
+                    let path = renderer.templates_path.join("unary.wgsl");
+                    renderer.tera.add_template_file(path, Some("unary"))?;
 
-                let mut context = Context::new();
-                let tera_func = match func {
-                    UnaryOp::Tanh => String::from("safe_tanh"),
-                    _ => func.to_string(),
-                };
-                context.insert("func", &tera_func);
-                context.insert("elem", &ke.as_wgsl(WgslDType::F32));
-                context.insert("elem_size", &ke.as_size());
-                let rendered = renderer.tera.render("unary", &context)?;
+                    let mut context = Context::new();
+                    let tera_func = match func {
+                        UnaryOp::Tanh => String::from("safe_tanh"),
+                        _ => func.to_string(),
+                    };
+                    context.insert("inplace", inplace);
+                    context.insert("func", &tera_func);
+                    context.insert("elem", &ke.as_wgsl(WgslDType::F32));
+                    context.insert("elem_size", &ke.as_size());
+                    let rendered = renderer.tera.render("unary", &context)?;
 
-                let kernel_fname = format!("{}_{}.wgsl", func, ke);
-                let mut file = File::create(renderer.dest_path.join(kernel_fname))?;
-                file.write_all(rendered.as_bytes())?;
+                    let kernel_fname = if *inplace {
+                        format!("{}_inplace_{}.wgsl", func, ke)
+                    } else {
+                        format!("{}_{}.wgsl", func, ke)
+                    };
+                    let mut file = File::create(renderer.dest_path.join(kernel_fname))?;
+                    file.write_all(rendered.as_bytes())?;
+                }
             }
         }
         Ok(())

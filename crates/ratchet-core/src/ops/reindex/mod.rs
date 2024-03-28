@@ -39,6 +39,14 @@ pub struct ReindexMeta {
 impl OpMetadata for ReindexMeta {}
 
 impl MetaOperation for Reindex {
+    fn kernel_name(&self) -> String {
+        match self {
+            Reindex::Permute(_) => "permute".to_string(),
+            Reindex::Slice(_) => "slice".to_string(),
+            Reindex::Broadcast(_) => "broadcast".to_string(),
+        }
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         match self {
             Reindex::Permute(p) => rvec![&p.src],
@@ -71,7 +79,7 @@ impl MetaOperation for Reindex {
         Ok(BindGroupLayoutDescriptor::unary())
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, inplace: bool, dst: &Tensor) -> String {
         let op_key = match self {
             Reindex::Permute(_) => "permute",
             Reindex::Slice(_) => "slice",

@@ -82,6 +82,20 @@ impl Operation for Unary {
 }
 
 impl MetaOperation for Unary {
+    fn kernel_name(&self) -> String {
+        self.op.kernel_name().to_string()
+    }
+
+    fn kernel_key(&self, inplace: bool, dst: &Tensor) -> String {
+        let kn = self.kernel_name();
+        let ke = self.kernel_element(dst).as_str();
+        if inplace {
+            format!("{}_inplace_{}", kn, ke)
+        } else {
+            format!("{}_{}", kn, ke)
+        }
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         rvec![&self.input]
     }
@@ -124,14 +138,6 @@ impl MetaOperation for Unary {
         } else {
             Ok(BindGroupLayoutDescriptor::unary())
         }
-    }
-
-    fn kernel_key(&self, dst: &Tensor) -> String {
-        format!(
-            "{}_{}",
-            self.op.kernel_name(),
-            self.kernel_element(dst).as_str()
-        )
     }
 
     fn write_metadata(

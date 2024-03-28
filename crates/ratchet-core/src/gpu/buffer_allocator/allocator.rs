@@ -252,6 +252,7 @@ impl BufferAllocator {
         execution_order: &[&Tensor],
         device: &WgpuDevice,
     ) -> Result<FxHashMap<TensorId, PooledGPUBuffer>, DeviceError> {
+        println!("EXECUTION ORDER: {:#?}", execution_order);
         let mut free = Vec::new(); //TODO: switch to BTreeMap
         let mut assignments = FxHashMap::default();
         //Assignments already needs all of the constants in it.
@@ -269,7 +270,7 @@ impl BufferAllocator {
             }
         }
 
-        //The output never gets allocated in the below loop, because it is not a source.
+        //The output tensor is a special case.
         //We know we need an allocation for the output.
         //We traverse upwards until we find the first non-inplace operation, and use it's buffer.
         //It's also handy to treat output as different, as we can handle getting data back to CPU
@@ -290,10 +291,13 @@ impl BufferAllocator {
                     device,
                 )
             });
+        println!("OUTPUT BUFFER: {:?}", output_buffer);
         assignments.insert(output.id(), output_buffer);
 
         //Allocate intermediates
         self.greedy_by_size(execution_order, &mut assignments, device)?;
+
+        println!("ALLOCATIONS: {:#?}", assignments);
 
         log::debug!(
             "Total bytes allocated: {}kb",

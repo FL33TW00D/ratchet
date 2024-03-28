@@ -82,7 +82,11 @@ impl Operation for Binary {
 }
 
 impl MetaOperation for Binary {
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_name(&self) -> String {
+        self.op.kernel_name().to_string()
+    }
+
+    fn kernel_key(&self, inplace: bool, dst: &Tensor) -> String {
         format!(
             "{}_{}",
             self.op.kernel_name(),

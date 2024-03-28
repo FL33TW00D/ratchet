@@ -36,6 +36,10 @@ impl Operation for IndexWrite {
 }
 
 impl MetaOperation for IndexWrite {
+    fn kernel_name(&self) -> String {
+        "index_write".to_string()
+    }
+
     fn supports_inplace(&self) -> bool {
         true
     }
@@ -44,7 +48,7 @@ impl MetaOperation for IndexWrite {
         rvec![&self.dst, &self.src]
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, inplace: bool, dst: &Tensor) -> String {
         format!("index_write_{}", self.kernel_element(dst).as_str())
     }
 

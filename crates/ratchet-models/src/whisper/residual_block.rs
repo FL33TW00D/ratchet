@@ -1,7 +1,7 @@
 use super::{mha::*, mlp::MLP};
 use crate::model::Whisper;
 use ratchet::{Device, Tensor};
-use ratchet_loader::GGMLModel;
+use ratchet_loader::ggml::GGMLModel;
 use ratchet_nn::{KVEntry, LayerNorm, Linear, Module};
 use std::io::{BufRead, Seek};
 

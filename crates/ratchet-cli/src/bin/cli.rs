@@ -1,7 +1,7 @@
 use clap::{value_parser, Arg, ArgMatches, Command};
 use hf_hub::api::sync::Api;
 use ratchet::{Device, DeviceRequest};
-use ratchet_loader::GGMLCompatible;
+use ratchet_loader::ggml::GGMLCompatible;
 use ratchet_models::model::Whisper;
 use ratchet_models::options::DecodingOptionsBuilder;
 use ratchet_models::registry::{AvailableModels, Quantization, Whisper as RegistryWhisper};

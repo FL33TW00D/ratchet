@@ -5,7 +5,7 @@ use std::{
 
 use ratchet::{Device, NDArrayExt, Quantization, Quantizer, Tensor};
 
-use crate::GGMLCompatible;
+use crate::ggml::GGMLCompatible;
 
 pub struct Converter;
 

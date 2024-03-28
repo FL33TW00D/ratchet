@@ -53,6 +53,18 @@ impl From<&Strides> for glam::UVec4 {
     }
 }
 
+impl From<Strides> for glam::IVec3 {
+    fn from(strides: Strides) -> Self {
+        (&strides).into()
+    }
+}
+
+impl From<&Strides> for glam::IVec3 {
+    fn from(strides: &Strides) -> Self {
+        glam::IVec3::new(strides.0[0] as _, strides.0[1] as _, strides.0[2] as _)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::shape;

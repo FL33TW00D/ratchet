@@ -3,7 +3,7 @@ use std::io::{BufRead, Seek};
 use crate::model::Whisper;
 use crate::whisper::residual_block::*;
 use ratchet::prelude::*;
-use ratchet_loader::GGMLModel;
+use ratchet_loader::ggml::GGMLModel;
 use ratchet_nn::{Embedding, KVCache, LayerNorm, Module};
 
 #[derive(Debug)]
@@ -139,7 +139,7 @@ impl WhisperDecoder {
             blocks,
             mask: Self::load_mask(hparams.n_text_ctx as _, device),
             ln_post: LayerNorm::new(lt("weight")?, Some(lt("bias")?), 1e-5),
-            cache: KVCache::new(n_layers, &shape![1, Self::MAX_CACHE, n_state], device),
+            cache: KVCache::new(n_layers, shape![1, Self::MAX_CACHE, n_state], device),
             device: device.clone(),
         })
     }
@@ -156,7 +156,7 @@ mod tests {
         types::{IntoPyDict, PyTuple},
     };
     use ratchet::{shape, Device, DeviceRequest, Tensor};
-    use ratchet_loader::GGMLCompatible;
+    use ratchet_loader::ggml::GGMLCompatible;
     use ratchet_nn::Module;
     use tokenizers::Tokenizer;
 

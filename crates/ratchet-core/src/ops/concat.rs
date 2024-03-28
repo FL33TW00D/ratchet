@@ -55,11 +55,15 @@ impl OpGuards for Concat {
 }
 
 impl MetaOperation for Concat {
+    fn kernel_name(&self) -> String {
+        "concat".to_string()
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         self.inputs.iter().collect()
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, _: bool, dst: &Tensor) -> String {
         let ke = self.kernel_element(dst).as_str();
         let num_inputs = self.inputs.len();
         format!("concat{}_{}", num_inputs, ke)

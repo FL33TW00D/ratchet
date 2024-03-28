@@ -1,9 +1,10 @@
 mod converter;
-mod ggml;
+mod error;
+pub mod ggml;
+pub mod gguf;
 mod k_quants;
 
 pub use converter::*;
-pub use ggml::*;
 
 pub const STORAGE_BUFFER_ALIGN: usize = 256;
 
@@ -43,8 +44,6 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
-    //--- OURS ---
-    WQ8,
 }
 
 impl From<GgmlDType> for ratchet::DType {
@@ -52,7 +51,6 @@ impl From<GgmlDType> for ratchet::DType {
         match val {
             GgmlDType::F32 => ratchet::DType::F32,
             GgmlDType::F16 => ratchet::DType::F16,
-            GgmlDType::WQ8 => ratchet::DType::WQ8,
             _ => unimplemented!(),
         }
     }
@@ -77,7 +75,6 @@ impl TryFrom<u32> for GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
-            64 => Self::WQ8,
             _ => return Err(LoadError::InvalidDType(u)),
         };
         Ok(dtype)
@@ -101,7 +98,6 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
-            Self::WQ8 => 64,
         }
     }
 
@@ -124,7 +120,6 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
-            Self::WQ8 => std::mem::size_of::<BlockWQ8>(),
         }
     }
 
@@ -133,7 +128,6 @@ impl GgmlDType {
         match self {
             Self::F32 => 1,
             Self::F16 => 1,
-            Self::WQ8 => 16,
             Self::Q4_0 => k_quants::QK4_0,
             Self::Q4_1 => k_quants::QK4_1,
             Self::Q5_0 => k_quants::QK5_0,
@@ -145,25 +139,6 @@ impl GgmlDType {
     }
 
     pub fn tensor_size(&self, numel: usize) -> usize {
-        match self {
-            Self::WQ8 => {
-                //Returns the aligned number of BYTES
-                let aligner = |numel: usize, size_t: usize| -> usize {
-                    let nbytes = numel * size_t;
-
-                    if nbytes % STORAGE_BUFFER_ALIGN != 0 {
-                        nbytes + STORAGE_BUFFER_ALIGN - nbytes % STORAGE_BUFFER_ALIGN
-                    } else {
-                        nbytes
-                    }
-                };
-                let weight_size = numel / 4;
-                let absmax_size = numel / 16;
-
-                aligner(weight_size, std::mem::size_of::<u32>())
-                    + aligner(absmax_size, std::mem::size_of::<f32>())
-            }
-            _ => numel * self.type_size() / self.block_size(),
-        }
+        numel * self.type_size() / self.block_size()
     }
 }

@@ -52,6 +52,7 @@ impl Tensor {
         }
     }
 
+    #[track_caller]
     fn lazy(op: LazyOp, meta: StorageView, device: Device) -> Self {
         op.check_invariants();
         Self::new(op, meta, None, device)
@@ -319,7 +320,7 @@ impl Tensor {
     //TODO: horrific interface
     pub fn matmul(self, other: Tensor, trans_a: bool, trans_b: bool) -> anyhow::Result<Tensor> {
         let device = self.device.clone();
-        let matmul = Matmul::new(self, other, trans_a, trans_b, RefCell::new(None));
+        let matmul = Matmul::new(self, other, trans_a, trans_b);
         let new_view = matmul.compute_view()?;
         Ok(Tensor::lazy(LazyOp::Matmul(matmul), new_view, device))
     }

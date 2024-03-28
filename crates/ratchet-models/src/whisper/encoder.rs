@@ -1,7 +1,7 @@
 use std::io::{BufRead, Seek};
 
 use ratchet::{Device, Tensor};
-use ratchet_loader::GGMLModel;
+use ratchet_loader::ggml::GGMLModel;
 use ratchet_nn::{LayerNorm, Module};
 
 use super::residual_block::{ResidualAttentionBlock, ResidualAttentionBlockInputs};
@@ -133,7 +133,7 @@ impl WhisperEncoder {
 mod tests {
     use hf_hub::api::sync::Api;
     use ratchet::{Device, DeviceRequest, Tensor};
-    use ratchet_loader::GGMLCompatible;
+    use ratchet_loader::ggml::GGMLCompatible;
     use ratchet_nn::Module;
 
     use crate::{model::Whisper, whisper::encoder::WhisperEncoder};

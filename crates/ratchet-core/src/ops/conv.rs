@@ -66,11 +66,15 @@ impl Operation for Conv {
 }
 
 impl MetaOperation for Conv {
+    fn kernel_name(&self) -> String {
+        "conv".to_string()
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         rvec![&self.input, &self.weight, self.bias.as_ref().unwrap()]
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, _: bool, dst: &Tensor) -> String {
         format!("conv_{}", self.kernel_element(dst).as_str())
     }
 

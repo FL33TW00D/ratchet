@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Ordering};
+use std::cmp::Ordering;
 
 use derive_new::new;
 use encase::ShaderType;
@@ -9,7 +9,6 @@ use crate::{
     Operation, OperationError, RVec, Shape, StorageView, Strides, Tensor,
 };
 
-// Defines a matrix multiplication operation.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MatmulSpec {
@@ -194,7 +193,6 @@ pub struct Matmul {
     rhs: Tensor,
     trans_a: bool,
     trans_b: bool,
-    spec: RefCell<Option<MatmulSpec>>,
 }
 
 impl Matmul {
@@ -257,9 +255,8 @@ impl Matmul {
         Ok(c_shape_final)
     }
 
-    pub fn compute_spec(&self, dst: &Tensor) {
-        let spec = MatmulSpec::new(&self.lhs, &self.rhs, dst, self.trans_a, self.trans_b);
-        self.spec.replace(Some(spec));
+    pub fn compute_spec(&self, dst: &Tensor) -> MatmulSpec {
+        MatmulSpec::new(&self.lhs, &self.rhs, dst, self.trans_a, self.trans_b)
     }
 }
 
@@ -307,14 +304,12 @@ impl OpGuards for Matmul {
 }
 
 impl MetaOperation for Matmul {
-    fn update(&self, dst: &Tensor) -> Result<(), OperationError> {
-        self.compute_spec(dst);
-        Ok(())
+    fn kernel_name(&self) -> String {
+        "MatMul".to_string()
     }
 
-    fn kernel_key(&self, _: &Tensor) -> String {
-        let ref_spec = self.spec.borrow();
-        let spec = ref_spec.as_ref().unwrap();
+    fn kernel_key(&self, _: bool, dst: &Tensor) -> String {
+        let spec = self.compute_spec(dst);
         let (a_fit, b_fit, out_fit) = spec.tile_fit();
         let ke = spec.select_kernel_element();
 
@@ -358,15 +353,13 @@ impl MetaOperation for Matmul {
         rvec![&self.lhs, &self.rhs]
     }
 
-    fn kernel_element(&self, _: &Tensor) -> KernelElement {
-        let ref_spec = self.spec.borrow();
-        let spec = ref_spec.as_ref().unwrap();
+    fn kernel_element(&self, dst: &Tensor) -> KernelElement {
+        let spec = self.compute_spec(dst);
         spec.select_kernel_element()
     }
 
-    fn calculate_dispatch(&self, _: &Tensor) -> Result<WorkgroupCount, OperationError> {
-        let ref_spec = self.spec.borrow();
-        let spec = ref_spec.as_ref().unwrap();
+    fn calculate_dispatch(&self, dst: &Tensor) -> Result<WorkgroupCount, OperationError> {
+        let spec = self.compute_spec(dst);
 
         let TILE_DIM = 32;
         let a_shape = spec.a_shape();
@@ -397,39 +390,34 @@ impl MetaOperation for Matmul {
     fn write_metadata(
         &self,
         uniform: &mut CpuUniform,
-        _: &Tensor,
+        dst: &Tensor,
         _: &KernelElement,
     ) -> Result<u64, OperationError> {
-        let ref_spec = self.spec.borrow();
-        let spec = ref_spec.as_ref().unwrap();
+        let spec = self.compute_spec(dst);
 
         let mut a_shape = spec.a_shape.clone();
         a_shape.insert(0, spec.a_stack());
-        let aStrides = Strides::from(&a_shape).to_vec();
+        let aStrides = Strides::from(&a_shape);
 
         let mut b_shape = spec.b_shape.clone();
         b_shape.insert(0, spec.b_stack());
-        let bStrides = Strides::from(&b_shape).to_vec();
+        let bStrides = Strides::from(&b_shape);
 
         let mut out_shape = spec.c_shape.clone();
         out_shape.insert(0, spec.stacks());
-        let outStrides = Strides::from(&out_shape).to_vec();
+        let outStrides = Strides::from(&out_shape);
 
         let dimAOuter = spec.dim_a_outer() as i32;
         let dimBOuter = spec.dim_b_outer() as i32;
         let dimInner = spec.dim_inner() as i32;
 
         let meta = MatmulMeta {
-            aShape: glam::IVec3::new(a_shape[0] as _, a_shape[1] as _, a_shape[2] as _),
-            aStrides: glam::IVec3::new(aStrides[0] as _, aStrides[1] as _, aStrides[2] as _),
-            bShape: glam::IVec3::new(b_shape[0] as _, b_shape[1] as _, b_shape[2] as _),
-            bStrides: glam::IVec3::new(bStrides[0] as _, bStrides[1] as _, bStrides[2] as _),
-            outShape: glam::IVec3::new(out_shape[0] as _, out_shape[1] as _, out_shape[2] as _),
-            outStrides: glam::IVec3::new(
-                outStrides[0] as _,
-                outStrides[1] as _,
-                outStrides[2] as _,
-            ),
+            aShape: a_shape.into(),
+            aStrides: aStrides.into(),
+            bShape: b_shape.into(),
+            bStrides: bStrides.into(),
+            outShape: out_shape.into(),
+            outStrides: outStrides.into(),
             dimAOuter,
             dimBOuter,
             dimInner,

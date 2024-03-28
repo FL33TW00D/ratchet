@@ -211,7 +211,25 @@ impl From<&Shape> for glam::UVec4 {
     }
 }
 
-macro_rules! impl_try_into_for_shape {
+impl From<Shape> for glam::UVec4 {
+    fn from(shape: Shape) -> Self {
+        (&shape).into()
+    }
+}
+
+impl From<&Shape> for glam::IVec3 {
+    fn from(shape: &Shape) -> Self {
+        glam::IVec3::new(shape[0] as i32, shape[1] as i32, shape[2] as i32)
+    }
+}
+
+impl From<Shape> for glam::IVec3 {
+    fn from(shape: Shape) -> Self {
+        (&shape).into()
+    }
+}
+
+macro_rules! impl_try_into_arr_for_shape {
     ($($N:expr),*) => {
         $(
             impl TryInto<[usize; $N]> for &Shape {
@@ -233,7 +251,7 @@ macro_rules! impl_try_into_for_shape {
     };
 }
 
-impl_try_into_for_shape!(1, 2, 3, 4);
+impl_try_into_arr_for_shape!(1, 2, 3, 4);
 
 #[cfg(test)]
 mod tests {

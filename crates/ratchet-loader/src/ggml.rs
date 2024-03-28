@@ -255,14 +255,3 @@ pub trait GGMLCompatible: Sized {
         Ok(data.len())
     }
 }
-
-struct GGMLWriter;
-
-impl GGMLWriter {
-    pub fn write<W: std::io::Write, M: GGMLCompatible>(
-        _writer: &mut W,
-        _model: &M,
-    ) -> std::io::Result<()> {
-        todo!()
-    }
-}

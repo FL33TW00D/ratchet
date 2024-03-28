@@ -51,6 +51,12 @@ pub struct NormMeta {
 impl OpMetadata for NormMeta {}
 
 impl MetaOperation for Norm {
+    fn kernel_name(&self) -> String {
+        match self {
+            Norm::LayerNorm(_) => "layernorm".to_string(),
+        }
+    }
+
     fn srcs(&self) -> RVec<&Tensor> {
         match self {
             Norm::LayerNorm(LayerNorm {
@@ -62,7 +68,7 @@ impl MetaOperation for Norm {
         }
     }
 
-    fn kernel_key(&self, dst: &Tensor) -> String {
+    fn kernel_key(&self, inplace: bool, dst: &Tensor) -> String {
         let op_key = match self {
             Norm::LayerNorm(_) => "layernorm",
         };
