@@ -3,9 +3,9 @@ use half::f16;
 use ratchet_macros::WgslMetadata;
 
 use crate::{
-    gpu::dtype::WgslDType, rvec, Array, BindingMode, BuiltIn, CpuUniform, DType, GEMMSpec,
-    InvariantError, KernelElement, KernelSource, Matmul, MatmulMeta, OperationError, Scalar,
-    Tensor, Vec4, WgslFragment, WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
+    gpu::dtype::WgslDType, rvec, Array, BindingMode, BuiltIn, CpuUniform, DType, GEMMMeta,
+    GEMMSpec, InvariantError, KernelElement, KernelSource, Matmul, OperationError, Scalar, Tensor,
+    Vec4, WgslFragment, WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
 };
 use glam::IVec3;
 use inline_wgsl::wgsl;
@@ -61,7 +61,7 @@ impl WorkgroupGEMVMeta {
         uniform: &mut CpuUniform,
         spec: &GEMMSpec,
     ) -> Result<u64, OperationError> {
-        MatmulMeta::write_metadata(uniform, spec)
+        GEMMMeta::write_metadata(uniform, spec)
     }
 }
 
@@ -335,7 +335,7 @@ impl GEMV {
         inplace: bool,
         _: &Tensor,
         workgroup_size: &WorkgroupSize,
-        spec: GEMMSpec,
+        _: GEMMSpec,
     ) -> Result<KernelSource, OperationError> {
         const TM: usize = 4;
         const TN: usize = 4;

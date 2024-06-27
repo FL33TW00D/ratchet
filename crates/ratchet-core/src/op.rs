@@ -147,13 +147,13 @@ pub enum OperationError {
 ///
 /// Marker trait for metadata structs that are written into the uniform buffer for each kernel.
 ///
+/// Should not be implemented by hand, use the `WgslMetadata` derive macro.
+///
 /// Some kernels may not know their metadata at compile time, so this is not an associated type.
 /// If they do not know their metadata at compile time, they should use [DynamicUniformBuffer] from
 /// encase.
 pub trait OpMetadata: Debug + Sized + ShaderType + WriteInto {
-    fn render() -> WgslFragment {
-        todo!()
-    }
+    fn render() -> WgslFragment;
 }
 
 /// Unique string representing a kernel.

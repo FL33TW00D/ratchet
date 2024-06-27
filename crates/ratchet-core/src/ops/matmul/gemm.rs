@@ -3,9 +3,9 @@ use half::f16;
 use ratchet_macros::WgslMetadata;
 
 use crate::{
-    gpu::dtype::WgslDType, rvec, Array, BindingMode, BuiltIn, DType, GEMMSpec, InvariantError,
-    KernelElement, KernelSource, Matmul, OperationError, Scalar, Tensor, Vec2, Vec4, WgslFragment,
-    WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
+    gpu::dtype::WgslDType, rvec, Array, BindingMode, BuiltIn, CpuUniform, DType, GEMMSpec,
+    InvariantError, KernelElement, KernelSource, Matmul, OperationError, Scalar, Strides, Tensor,
+    Vec2, Vec4, WgslFragment, WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
 };
 use glam::IVec3;
 use inline_wgsl::wgsl;
@@ -55,6 +55,42 @@ pub struct GEMMMeta {
     dimInner: i32,
 }
 
+impl GEMMMeta {
+    pub(crate) fn write_metadata(
+        uniform: &mut CpuUniform,
+        spec: &GEMMSpec,
+    ) -> Result<u64, OperationError> {
+        let mut lhs_shape = spec.lhs_shape.clone();
+        lhs_shape.insert(0, spec.lhs_stack());
+        let aStrides = Strides::from(&lhs_shape);
+
+        let mut rhs_shape = spec.rhs_shape.clone();
+        rhs_shape.insert(0, spec.rhs_stack());
+        let bStrides = Strides::from(&rhs_shape);
+
+        let mut out_shape = spec.out_shape.clone();
+        out_shape.insert(0, spec.stacks());
+        let outStrides = Strides::from(&out_shape);
+
+        let dimAOuter = spec.dim_lhs_outer() as i32;
+        let dimBOuter = spec.dim_rhs_outer() as i32;
+        let dimInner = spec.dim_inner() as i32;
+
+        let meta = GEMMMeta {
+            aShape: lhs_shape.into(),
+            aStrides: aStrides.into(),
+            bShape: rhs_shape.into(),
+            bStrides: bStrides.into(),
+            outShape: out_shape.into(),
+            outStrides: outStrides.into(),
+            dimAOuter,
+            dimBOuter,
+            dimInner,
+        };
+        Ok(uniform.write(&meta)?)
+    }
+}
+
 impl GEMM {
     fn write_indexing<P: WgslPrimitive>(&self, builder: &mut WgslKernelBuilder) {
         let accessor = P::render_type();
@@ -91,6 +127,7 @@ impl GEMM {
         let (A, _, _) = (&self.lhs, &self.rhs, &self.bias);
         let accessor = P::render_type();
         let W = P::W;
+        let dt = P::T::DT;
         builder.write_unpack(A.dt());
 
         let a_getters = match A.dt() {
@@ -101,25 +138,13 @@ impl GEMM {
                     }
                 }
             }
-            DType::Q8_0F(_) => {
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
                 wgsl! {
-                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<f32> {
+                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<'dt> {
                         return unpack(A[getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 4]);
                     }
 
-                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> f32 {
-                        let abs_index = getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 32;
-                        return scale[abs_index];
-                    }
-                }
-            }
-            DType::Q8_0H(_) => {
-                wgsl! {
-                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<f16> {
-                        return unpack(A[getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 4]);
-                    }
-
-                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> f16 {
+                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> 'dt {
                         let abs_index = getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 32;
                         return scale[abs_index];
                     }
@@ -137,17 +162,10 @@ impl GEMM {
                     }
                 });
             }
-            DType::Q8_0F(_) => {
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
                 builder.write_global(wgsl! {
-                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> f32 {
+                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> 'dt {
                         return f32(B[getBIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 'W]);
-                    }
-                });
-            }
-            DType::Q8_0H(_) => {
-                builder.write_global(wgsl! {
-                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> f16 {
-                        return f16(B[getBIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 'W]);
                     }
                 });
             }
@@ -277,19 +295,21 @@ impl GEMM {
                 }
                 builder.register_storage("result", BindingMode::ReadWrite, float_arr);
             }
-            DType::Q8_0F(_) => {
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
                 builder.register_storage("A", ro, Array::<Scalar<u32>>::default());
                 builder.register_storage("scale", ro, float_arr);
-                builder.register_storage("B", ro, Array::<Scalar<f32>>::default());
+                builder.register_storage("B", ro, Array::<Scalar<P::T>>::default());
                 if bias.is_some() {
                     builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
                 }
                 builder.register_storage("result", BindingMode::ReadWrite, float_arr);
             }
-            DType::Q8_0H(_) => {
+            DType::Q4_KF(_) | DType::Q4_KH(_) => {
                 builder.register_storage("A", ro, Array::<Scalar<u32>>::default());
-                builder.register_storage("scale", ro, float_arr);
-                builder.register_storage("B", ro, Array::<Scalar<f16>>::default());
+                builder.register_storage("scales", ro, float_arr);
+                builder.register_storage("dmin", ro, float_arr);
+                builder.register_storage("d", ro, float_arr);
+                builder.register_storage("B", ro, Array::<Scalar<P::T>>::default());
                 if bias.is_some() {
                     builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
                 }
@@ -335,7 +355,13 @@ impl GEMM {
             (DType::Q8_0H(_), _) => {
                 self.build_gemm::<Scalar<f16>>(inplace, dst, workgroup_size, spec)
             }
-            _ => panic!("Unsupported dtype"),
+            (DType::Q4_KF(_), _) => {
+                self.build_gemm::<Scalar<f32>>(inplace, dst, workgroup_size, spec)
+            }
+            (DType::Q4_KH(_), _) => {
+                self.build_gemm::<Scalar<f16>>(inplace, dst, workgroup_size, spec)
+            }
+            _ => return Err(InvariantError::UnsupportedDType(self.lhs.dt()).into()),
         }
     }
 
@@ -344,6 +370,7 @@ impl GEMM {
         mut kernel_builder: WgslKernelBuilder,
     ) -> Result<KernelSource, OperationError> {
         const ROW_PER_THREAD: usize = 4;
+        const COL_PER_THREAD: usize = 4;
         const TILE_DIM: usize = 32;
 
         let accessor = P::render_type();
@@ -360,7 +387,7 @@ impl GEMM {
             let batchA = batch % metadata.aShape[0];
             let batchB = batch % metadata.bShape[0];
 
-            let tileRow = i32(local_invocation_id.y) * 4;
+            let tileRow = i32(local_invocation_id.y) * 'ROW_PER_THREAD;
             let tileCol = i32(local_invocation_id.x) * 4;
 
             let globalRowStart = i32(workgroup_id.y) * 'T_W;

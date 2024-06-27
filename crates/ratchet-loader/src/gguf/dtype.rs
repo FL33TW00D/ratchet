@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 use half::f16;
 use ratchet::{DType, Device, Padding, Shape, Tensor};
-use ratchet::{Q8_0F, Q8_0H};
+use ratchet::{Q4_KF, Q4_KH, Q8_0F, Q8_0H};
 
 use crate::k_quants::*;
 
@@ -34,6 +34,94 @@ pub trait GGUFInterop {
         shape: Shape,
         device: &Device,
     ) -> anyhow::Result<Tensor>;
+}
+
+impl GGUFInterop for Q4_KF {
+    type GGUF_TYPE = BlockQ4K;
+    const BLCK_NUMEL: usize = QK_K;
+
+    fn transcode(
+        data: &[Self::GGUF_TYPE],
+        n_blocks: usize,
+        shape: Shape,
+        device: &Device,
+    ) -> anyhow::Result<Tensor> {
+        //TODO: these should be uninit
+        let mut qs_bytes = Vec::with_capacity(n_blocks * QK_K);
+        let mut scales_bytes = Vec::with_capacity(n_blocks * K_SCALE_SIZE);
+        let mut dmin_bytes = Vec::with_capacity(n_blocks * 4);
+        let mut d_bytes = Vec::with_capacity(n_blocks * 4);
+
+        for block in data {
+            dmin_bytes.extend_from_slice(&block.dmin.to_f32().to_le_bytes());
+            d_bytes.extend_from_slice(&block.d.to_f32().to_le_bytes());
+            let block_qs = block.qs;
+            qs_bytes.extend_from_slice(bytemuck::cast_slice(&block_qs));
+            scales_bytes.extend_from_slice(bytemuck::cast_slice(&block.scales));
+        }
+
+        let _ = qs_bytes.pad_to_offset();
+        let _ = scales_bytes.pad_to_offset();
+        let _ = dmin_bytes.pad_to_offset();
+        let _ = d_bytes.pad_to_offset();
+
+        qs_bytes.append(&mut scales_bytes);
+        qs_bytes.append(&mut dmin_bytes);
+        qs_bytes.append(&mut d_bytes);
+        let casted = bytemuck::cast_slice::<u8, u32>(&qs_bytes);
+        unsafe {
+            Ok(Tensor::from_quantized::<u32, _>(
+                casted,
+                DType::Q4_KF(Q4_KF::default()),
+                shape,
+                device.clone(),
+            ))
+        }
+    }
+}
+
+impl GGUFInterop for Q4_KH {
+    type GGUF_TYPE = BlockQ4K;
+    const BLCK_NUMEL: usize = QK_K;
+
+    fn transcode(
+        data: &[Self::GGUF_TYPE],
+        n_blocks: usize,
+        shape: Shape,
+        device: &Device,
+    ) -> anyhow::Result<Tensor> {
+        //TODO: these should be uninit
+        let mut qs_bytes = Vec::with_capacity(n_blocks * QK_K);
+        let mut scales_bytes = Vec::with_capacity(n_blocks * K_SCALE_SIZE);
+        let mut dmin_bytes = Vec::with_capacity(n_blocks * 2);
+        let mut d_bytes = Vec::with_capacity(n_blocks * 2);
+
+        for block in data {
+            dmin_bytes.extend_from_slice(&block.dmin.to_le_bytes());
+            d_bytes.extend_from_slice(&block.d.to_le_bytes());
+            let block_qs = block.qs;
+            qs_bytes.extend_from_slice(bytemuck::cast_slice(&block_qs));
+            scales_bytes.extend_from_slice(bytemuck::cast_slice(&block.scales));
+        }
+
+        let _ = qs_bytes.pad_to_offset();
+        let _ = scales_bytes.pad_to_offset();
+        let _ = dmin_bytes.pad_to_offset();
+        let _ = d_bytes.pad_to_offset();
+
+        qs_bytes.append(&mut scales_bytes);
+        qs_bytes.append(&mut dmin_bytes);
+        qs_bytes.append(&mut d_bytes);
+        let casted = bytemuck::cast_slice::<u8, u32>(&qs_bytes);
+        unsafe {
+            Ok(Tensor::from_quantized::<u32, _>(
+                casted,
+                DType::Q4_KH(Q4_KH::default()),
+                shape,
+                device.clone(),
+            ))
+        }
+    }
 }
 
 //TODO: code reuse

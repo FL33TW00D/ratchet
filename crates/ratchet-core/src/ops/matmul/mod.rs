@@ -1,3 +1,11 @@
+mod gemm;
+mod gemv;
+mod quantized;
+
+pub use gemm::*;
+pub use gemv::*;
+pub use quantized::*;
+
 use std::cmp::Ordering;
 
 use encase::ShaderType;
@@ -5,8 +13,8 @@ use encase::ShaderType;
 use crate::{
     gpu::{BindGroupLayoutDescriptor, CpuUniform, WorkgroupCount},
     rvec, wgc, wgs, DType, InvariantError, KernelElement, KernelKey, KernelSource, MetaOperation,
-    OpGuards, OpMetadata, Operation, OperationError, RVec, Shape, StorageView, Strides,
-    SubgroupGEMVMeta, Tensor, WorkgroupGEMVMeta, WorkgroupSize, Workload, GEMM, GEMV, Q8_0F, Q8_0H,
+    OpGuards, OpMetadata, Operation, OperationError, RVec, Shape, StorageView, Strides, Tensor,
+    WorkgroupSize, Workload, Q4_KF, Q4_KH, Q8_0F, Q8_0H,
 };
 
 //https://link.springer.com/chapter/10.1007/978-3-642-29737-3_42
@@ -372,58 +380,6 @@ impl Matmul {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[derive(Debug, Clone, ShaderType)]
-pub struct MatmulMeta {
-    aShape: glam::IVec3,
-    aStrides: glam::IVec3,
-    bShape: glam::IVec3,
-    bStrides: glam::IVec3,
-    outShape: glam::IVec3,
-    outStrides: glam::IVec3,
-    dimAOuter: i32,
-    dimBOuter: i32,
-    dimInner: i32,
-}
-
-impl MatmulMeta {
-    pub(crate) fn write_metadata(
-        uniform: &mut CpuUniform,
-        spec: &GEMMSpec,
-    ) -> Result<u64, OperationError> {
-        let mut lhs_shape = spec.lhs_shape.clone();
-        lhs_shape.insert(0, spec.lhs_stack());
-        let aStrides = Strides::from(&lhs_shape);
-
-        let mut rhs_shape = spec.rhs_shape.clone();
-        rhs_shape.insert(0, spec.rhs_stack());
-        let bStrides = Strides::from(&rhs_shape);
-
-        let mut out_shape = spec.out_shape.clone();
-        out_shape.insert(0, spec.stacks());
-        let outStrides = Strides::from(&out_shape);
-
-        let dimAOuter = spec.dim_lhs_outer() as i32;
-        let dimBOuter = spec.dim_rhs_outer() as i32;
-        let dimInner = spec.dim_inner() as i32;
-
-        let meta = MatmulMeta {
-            aShape: lhs_shape.into(),
-            aStrides: aStrides.into(),
-            bShape: rhs_shape.into(),
-            bStrides: bStrides.into(),
-            outShape: out_shape.into(),
-            outStrides: outStrides.into(),
-            dimAOuter,
-            dimBOuter,
-            dimInner,
-        };
-        Ok(uniform.write(&meta)?)
-    }
-}
-
-impl OpMetadata for MatmulMeta {}
-
 impl Operation for Matmul {
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         let c_shape = Matmul::compute_c_shape(
@@ -457,18 +413,22 @@ impl OpGuards for Matmul {
             (DType::F16, DType::F16),
             (DType::Q8_0F(Q8_0F::default()), DType::F32),
             (DType::Q8_0H(Q8_0H::default()), DType::F16),
+            (DType::Q4_KF(Q4_KF::default()), DType::F32),
+            (DType::Q4_KH(Q4_KH::default()), DType::F16),
         ];
+
         if !allowed_pairs.contains(&(self.lhs.dt(), self.rhs.dt())) {
             panic!(
-                "Failed to validate DTypes: {:?}, {:?}",
+                "DType mismatch: lhs: {:?}, rhs: {:?}",
                 self.lhs.dt(),
                 self.rhs.dt()
             );
         }
+
         if let Some(bias) = &self.bias {
             if bias.dt() != self.rhs.dt() {
                 panic!(
-                    "Failed to validate DTypes: bias {:?}, rhs {:?}",
+                    "DType mismatch: bias: {:?}, rhs: {:?}",
                     bias.dt(),
                     self.rhs.dt()
                 );
@@ -479,7 +439,7 @@ impl OpGuards for Matmul {
 
 impl MetaOperation for Matmul {
     fn kernel_name(&self) -> String {
-        "GEMM".to_string()
+        "Matmul".to_string()
     }
 
     fn kernel_key(
@@ -584,6 +544,8 @@ impl MetaOperation for Matmul {
             let group_y = WorkgroupCount::div_ceil(dimA, TILE_DIM);
             let workgroup_count = wgc![group_x as _, group_y as _, spec.stacks() as _];
 
+            println!("WORK GROUP COUNT: {:?}", workgroup_count);
+
             Ok(Workload {
                 workgroup_count,
                 workgroup_size: wgs![8, 8, 1],
@@ -593,19 +555,17 @@ impl MetaOperation for Matmul {
 
     fn storage_bind_group_layout(
         &self,
-        _inplace: bool,
+        _: bool,
     ) -> Result<BindGroupLayoutDescriptor, OperationError> {
-        let (LHS, RHS, bias) = (&self.lhs, &self.rhs, &self.bias);
-        let layout = match (LHS.dt(), RHS.dt(), bias.is_some()) {
-            (DType::F32, DType::F32, false) => BindGroupLayoutDescriptor::binary(),
-            (DType::F32, DType::F32, true) => BindGroupLayoutDescriptor::ternary(),
-            (DType::F16, DType::F16, false) => BindGroupLayoutDescriptor::binary(),
-            (DType::F16, DType::F16, true) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0F(_), DType::F32, false) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0H(_), DType::F16, false) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0F(_), DType::F32, true) => BindGroupLayoutDescriptor::nthary(4),
-            (DType::Q8_0H(_), DType::F16, true) => BindGroupLayoutDescriptor::nthary(4),
-            _ => return Err(InvariantError::UnsupportedDType(RHS.dt()).into()),
+        let (LHS, _, bias) = (&self.lhs, &self.rhs, &self.bias);
+        let layout = match (LHS.dt(), bias.is_some()) {
+            (DType::F32 | DType::F16, false) => BindGroupLayoutDescriptor::binary(),
+            (DType::F32 | DType::F16, true) => BindGroupLayoutDescriptor::ternary(),
+            (DType::Q8_0F(_) | DType::Q8_0H(_), false) => BindGroupLayoutDescriptor::ternary(),
+            (DType::Q8_0F(_) | DType::Q8_0H(_), true) => BindGroupLayoutDescriptor::nthary(4),
+            (DType::Q4_KF(_) | DType::Q4_KH(_), false) => BindGroupLayoutDescriptor::nthary(5),
+            (DType::Q4_KF(_) | DType::Q4_KH(_), true) => BindGroupLayoutDescriptor::nthary(6),
+            _ => return Err(InvariantError::UnsupportedDType(LHS.dt()).into()),
         };
         Ok(layout)
     }
@@ -625,7 +585,7 @@ impl MetaOperation for Matmul {
                 WorkgroupGEMVMeta::write_metadata(uniform, &spec)
             }
         } else {
-            MatmulMeta::write_metadata(uniform, &spec)
+            GEMMMeta::write_metadata(uniform, &spec)
         }
     }
 
@@ -636,12 +596,22 @@ impl MetaOperation for Matmul {
         workgroup_size: &WorkgroupSize,
     ) -> Result<KernelSource, OperationError> {
         let spec = self.compute_spec(dst);
-        if spec.is_gemv() {
-            let gemv: GEMV = self.clone().into();
-            gemv.build_kernel(inplace, dst, workgroup_size, spec)
-        } else {
-            let gemm: GEMM = self.clone().into();
-            gemm.build_kernel(inplace, dst, workgroup_size, spec)
+
+        match self.lhs.dt() {
+            DType::F32 | DType::F16 => {
+                if spec.is_gemv() {
+                    let gemv: GEMV = self.clone().into();
+                    gemv.build_kernel(inplace, dst, workgroup_size, spec)
+                } else {
+                    let gemm: GEMM = self.clone().into();
+                    gemm.build_kernel(inplace, dst, workgroup_size, spec)
+                }
+            }
+            DType::Q8_0F(_) | DType::Q8_0H(_) | DType::Q4_KF(_) | DType::Q4_KH(_) => {
+                let quantized: Quantized = self.clone().into();
+                quantized.build_kernel(inplace, dst, workgroup_size, spec)
+            }
+            _ => Err(InvariantError::UnsupportedDType(self.lhs.dt()).into()),
         }
     }
 }
