@@ -1,3 +1,4 @@
+#![allow(non_camel_case_types)]
 mod blocks;
 
 pub use blocks::*;
@@ -17,19 +18,13 @@ pub enum DType {
     U32,
     Q8_0H(Q8_0H), //Equivalent to GGUF Q8_0, with f16
     Q8_0F(Q8_0F), //Equivalent to GGUF Q8_0, with f32
+    Q4_KH(Q4_KH), //Equivalent to GGUF Q4_K, with f16
+    Q4_KF(Q4_KF), //Equivalent to GGUF Q4_K, with f32
 }
 
 impl std::fmt::Display for DType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DType::F16 => write!(f, "F16"),
-            DType::BF16 => write!(f, "BF16"),
-            DType::F32 => write!(f, "F32"),
-            DType::I32 => write!(f, "I32"),
-            DType::U32 => write!(f, "U32"),
-            DType::Q8_0H(_) => write!(f, "Q8_0H"),
-            DType::Q8_0F(_) => write!(f, "Q8_0F"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -39,6 +34,20 @@ impl DType {
             DType::F32 => 0,
             DType::F16 => 1,
             _ => unimplemented!(),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DType::F16 => "F16",
+            DType::BF16 => "BF16",
+            DType::F32 => "F32",
+            DType::I32 => "I32",
+            DType::U32 => "U32",
+            DType::Q8_0H(_) => "Q8_0H",
+            DType::Q8_0F(_) => "Q8_0F",
+            DType::Q4_KH(_) => "Q4_KH",
+            DType::Q4_KF(_) => "Q4_KF",
         }
     }
 
@@ -60,13 +69,26 @@ impl DType {
             DType::F32 => 4,
             DType::I32 => 4,
             DType::U32 => 4,
-            DType::Q8_0H(_) => std::mem::size_of::<BlockQ8_0<f16>>(),
-            DType::Q8_0F(_) => std::mem::size_of::<BlockQ8_0<f32>>(),
+            DType::Q8_0H(_) => std::mem::size_of::<BlockQ8_0H>(),
+            DType::Q8_0F(_) => std::mem::size_of::<BlockQ8_0F>(),
+            DType::Q4_KH(_) => std::mem::size_of::<BlockQ4_KH>(),
+            DType::Q4_KF(_) => std::mem::size_of::<BlockQ4_KF>(),
         }
     }
 
     pub fn is_quantized(self) -> bool {
+        matches!(
+            self,
+            DType::Q8_0H(_) | DType::Q8_0F(_) | DType::Q4_KH(_) | DType::Q4_KF(_)
+        )
+    }
+
+    pub fn is_q8(self) -> bool {
         matches!(self, DType::Q8_0H(_) | DType::Q8_0F(_))
+    }
+
+    pub fn is_q4(self) -> bool {
+        matches!(self, DType::Q4_KH(_) | DType::Q4_KF(_))
     }
 
     pub fn is_float(self) -> bool {
@@ -78,6 +100,8 @@ impl DType {
         match self {
             DType::Q8_0H(_) => DType::F16,
             DType::Q8_0F(_) => DType::F32,
+            DType::Q4_KH(_) => DType::F16,
+            DType::Q4_KF(_) => DType::F32,
             _ => *self,
         }
     }
@@ -86,6 +110,8 @@ impl DType {
         match self {
             DType::Q8_0F(q) => q.segments(numel),
             DType::Q8_0H(q) => q.segments(numel),
+            DType::Q4_KF(q) => q.segments(numel),
+            DType::Q4_KH(q) => q.segments(numel),
             _ => {
                 let mut total_bytes = numel * self.size_of();
                 total_bytes = max(total_bytes, MIN_STORAGE_BUFFER_SIZE).align_for_copy();

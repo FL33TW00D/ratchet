@@ -7,10 +7,11 @@ use ratchet_macros::WgslMetadata;
 use wgpu::BindGroupLayoutEntry;
 
 use crate::{
-    gpu::{BindGroupLayoutDescriptor, BindGroupLayoutEntryExt, CpuUniform},
-    rvec, Array, BindingMode, BuiltIn, DType, KernelElement, KernelSource, MetaOperation, OpGuards,
-    Operation, OperationError, RVec, Scalar, Shape, StorageView, Strides, Tensor, Vec2, Vec4,
-    WgslKernelBuilder, WgslPrimitive, WorkgroupSize, Workload,
+    gpu::{BindGroupLayoutDescriptor, BindGroupLayoutEntryExt},
+    rvec, Array, BindingMode, BuiltIn, DType, GPUOperation, Kernel, KernelElement,
+    KernelRenderable, KernelSource, OpGuards, Operation, OperationError, RVec, Scalar, Shape,
+    StorageView, Strides, Tensor, Vec2, Vec4, WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
+    Workload,
 };
 
 /// # Cache
@@ -29,12 +30,16 @@ pub struct Cache {
     offset: usize,
 }
 
-impl Cache {
+impl KernelRenderable for CacheKernels {
     fn register_bindings<P: WgslPrimitive>(
         &self,
         builder: &mut WgslKernelBuilder,
-        _: bool,
+        inplace: bool,
     ) -> Result<(), OperationError> {
+        if inplace {
+            return Err(OperationError::InplaceError(self.kernel_name().to_string()));
+        }
+
         builder.register_storage("C", BindingMode::ReadWrite, Array::<P>::default());
         builder.register_storage("S", BindingMode::ReadOnly, Array::<P>::default());
         builder.register_storage("D", BindingMode::ReadWrite, Array::<P>::default());
@@ -43,16 +48,13 @@ impl Cache {
         Ok(())
     }
 
-    fn build_cache<P: WgslPrimitive>(
+    fn render<P: WgslPrimitive>(
         &self,
         inplace: bool,
-        _: &Tensor,
+        dst: &Tensor,
         workgroup_size: &WorkgroupSize,
-    ) -> Result<KernelSource, OperationError>
-    where
-        P::T: num_traits::Float,
-    {
-        let device = self.cache.device().try_gpu().unwrap();
+    ) -> Result<KernelSource, OperationError> {
+        let device = dst.device().try_gpu()?;
         let mut kernel_builder = WgslKernelBuilder::new(
             workgroup_size.clone(),
             rvec![
@@ -63,7 +65,8 @@ impl Cache {
             device.compute_features().clone(),
         );
         self.register_bindings::<P>(&mut kernel_builder, inplace)?;
-        kernel_builder.write_metadata::<CacheMeta>();
+
+        kernel_builder.render_metadata(&self.metadata(dst, &self.kernel_element(dst))?);
         kernel_builder.write_offset_to_index();
         kernel_builder.write_index_to_offset();
 
@@ -125,6 +128,14 @@ impl OpGuards for Cache {
 }
 
 impl Operation for Cache {
+    fn name(&self) -> &'static str {
+        "Cache"
+    }
+
+    fn srcs(&self) -> RVec<&Tensor> {
+        rvec![&self.cache, &self.source]
+    }
+
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         let mut result_shape = self.cache.shape().clone();
         result_shape[self.dim] = self.offset + self.source.shape()[self.dim];
@@ -135,33 +146,32 @@ impl Operation for Cache {
             result_strides,
         ))
     }
-}
-
-impl MetaOperation for Cache {
-    fn kernel_name(&self) -> String {
-        "cache".to_string()
-    }
 
     fn supports_inplace(&self) -> bool {
         false
     }
+}
 
-    fn srcs(&self) -> RVec<&Tensor> {
-        rvec![&self.cache, &self.source]
-    }
+impl GPUOperation for Cache {
+    type KernelEnum = CacheKernels;
 
-    fn kernel_element(&self, _dst: &Tensor) -> KernelElement {
-        KernelElement::Scalar
+    fn select_kernel(&self) -> Self::KernelEnum {
+        CacheKernels::Standard(self.clone())
     }
+}
 
-    fn calculate_dispatch(&self, dst: &Tensor) -> Result<Workload, OperationError> {
-        Ok(Workload::std(dst.shape().numel(), self.kernel_element(dst)))
-    }
+pub enum CacheKernels {
+    Standard(Cache),
+}
+
+impl Kernel for CacheKernels {
+    type Metadata = CacheMeta;
 
     fn storage_bind_group_layout(
         &self,
         _: bool,
     ) -> Result<BindGroupLayoutDescriptor, OperationError> {
+        // Custom layout because of funky mutability requirements
         Ok(BindGroupLayoutDescriptor {
             entries: rvec![
                 BindGroupLayoutEntry::compute_storage_buffer(0, false),
@@ -171,29 +181,32 @@ impl MetaOperation for Cache {
         })
     }
 
-    fn write_metadata(
-        &self,
-        uniform: &mut CpuUniform,
-        dst: &Tensor,
-        _: &KernelElement,
-    ) -> Result<u64, OperationError> {
-        let original_rank = self.cache.rank();
-        let promotion = 4 - original_rank;
-        let promoted_dim = self.dim + promotion;
+    fn kernel_name(&self) -> String {
+        match self {
+            CacheKernels::Standard(_) => "cache".to_string(),
+        }
+    }
 
-        let cache_shape = Shape::promote(self.cache.shape().clone(), 4);
+    fn metadata(&self, dst: &Tensor, _: &KernelElement) -> Result<Self::Metadata, OperationError> {
+        let CacheKernels::Standard(inner) = self;
+
+        let original_rank = inner.cache.rank();
+        let promotion = 4 - original_rank;
+        let promoted_dim = inner.dim + promotion;
+
+        let cache_shape = Shape::promote(inner.cache.shape().clone(), 4);
         let cache_strides = Strides::from(&cache_shape);
 
-        let source_shape = Shape::promote(self.source.shape().clone(), 4);
+        let source_shape = Shape::promote(inner.source.shape().clone(), 4);
         let source_strides = Strides::from(&source_shape);
 
         let dst_shape = Shape::promote(dst.shape().clone(), 4);
         let dst_strides = Strides::from(&dst_shape);
 
-        let cum0 = self.offset as u32;
+        let cum0 = inner.offset as u32;
         let cum1 = cum0 + source_shape[promoted_dim] as u32;
 
-        let meta = CacheMeta {
+        Ok(CacheMeta {
             cache_stride: UVec4::from(&cache_strides),
             src_stride: UVec4::from(&source_strides),
             dst_stride: UVec4::from(&dst_strides),
@@ -201,9 +214,15 @@ impl MetaOperation for Cache {
             cum0,
             cum1,
             dim: promoted_dim as u32,
-        };
+        })
+    }
 
-        Ok(uniform.write(&meta)?)
+    fn kernel_element(&self, _dst: &Tensor) -> KernelElement {
+        KernelElement::Scalar
+    }
+
+    fn calculate_dispatch(&self, dst: &Tensor) -> Result<Workload, OperationError> {
+        Ok(Workload::std(dst.shape().numel(), self.kernel_element(dst)))
     }
 
     fn build_kernel(
@@ -215,22 +234,22 @@ impl MetaOperation for Cache {
         let kernel_element = self.kernel_element(dst);
         match (dst.dt(), &kernel_element) {
             (DType::F32, KernelElement::Scalar) => {
-                self.build_cache::<Scalar<f32>>(inplace, dst, workgroup_size)
+                self.render::<Scalar<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F32, KernelElement::Vec2) => {
-                self.build_cache::<Vec2<f32>>(inplace, dst, workgroup_size)
+                self.render::<Vec2<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F32, KernelElement::Vec4) => {
-                self.build_cache::<Vec4<f32>>(inplace, dst, workgroup_size)
+                self.render::<Vec4<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Scalar) => {
-                self.build_cache::<Scalar<f16>>(inplace, dst, workgroup_size)
+                self.render::<Scalar<f16>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Vec2) => {
-                self.build_cache::<Vec2<f16>>(inplace, dst, workgroup_size)
+                self.render::<Vec2<f16>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Vec4) => {
-                self.build_cache::<Vec4<f16>>(inplace, dst, workgroup_size)
+                self.render::<Vec4<f16>>(inplace, dst, workgroup_size)
             }
             _ => Err(OperationError::CompileError(format!(
                 "Unsupported dtype {:?} or kernel element {:?}",

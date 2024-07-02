@@ -1,8 +1,8 @@
 use crate::gpu::{BindGroupEntry, CpuUniform, WgpuDevice};
 use crate::{
-    dtype::Segments, ops::*, rvec, BufferSegment, CPUBuffer, CompiledOp, DType, Device,
-    DeviceStorage, Executable, GPUBuffer, InvariantError, LazyOp, MetaOperation, Operation,
-    OperationError, RVec, RawCPUBuffer, Shape, Storage, Strides, TensorDType, TensorId,
+    ops::*, rvec, BufferSegment, CPUBuffer, CompiledOp, DType, Device, DeviceStorage, Executable,
+    GPUBuffer, GPUOperation, InvariantError, LazyOp, Operation, OperationError, RVec, RawCPUBuffer,
+    Shape, Storage, Strides, TensorDType, TensorId,
 };
 use derive_new::new;
 use npyz::WriterBuilder;
@@ -323,9 +323,9 @@ impl Tensor {
     ) -> anyhow::Result<Tensor> {
         let device = self.device.clone();
         let group_norm = GroupNorm::new(Norm::new(self, weight, bias, eps), num_groups);
-        let new_view = group_norm.compute_view()?;
-        let op = LazyOp::Norm(NormOp::GroupNorm(group_norm));
-        Ok(Tensor::lazy(op, new_view, device))
+        let norm_op = NormOp::GroupNorm(group_norm);
+        let new_view = norm_op.compute_view()?;
+        Ok(Tensor::lazy(LazyOp::Norm(norm_op), new_view, device))
     }
 
     pub fn layer_norm(
@@ -336,17 +336,17 @@ impl Tensor {
     ) -> anyhow::Result<Tensor> {
         let device = self.device.clone();
         let layer_norm = Norm::new(self, weight, bias, eps);
-        let new_view = layer_norm.compute_view()?;
-        let op = LazyOp::Norm(NormOp::LayerNorm(layer_norm));
-        Ok(Tensor::lazy(op, new_view, device))
+        let op = NormOp::LayerNorm(layer_norm);
+        let new_view = op.compute_view()?;
+        Ok(Tensor::lazy(LazyOp::Norm(op), new_view, device))
     }
 
     pub fn rms_norm(self, weight: Tensor, eps: f32) -> anyhow::Result<Tensor> {
         let device = self.device.clone();
         let rms = Norm::new(self, weight, None, eps);
-        let new_view = rms.compute_view()?;
-        let op = LazyOp::Norm(NormOp::RMSNorm(rms));
-        Ok(Tensor::lazy(op, new_view, device))
+        let op = NormOp::RMSNorm(rms);
+        let new_view = op.compute_view()?;
+        Ok(Tensor::lazy(LazyOp::Norm(op), new_view, device))
     }
 
     pub fn conv1d(
@@ -710,46 +710,47 @@ impl Tensor {
         order
     }
 
-    pub fn compile(
+    pub fn compile_gpu(
         &self,
         uniform: &mut CpuUniform,
         device: &WgpuDevice,
         can_inplace: bool,
     ) -> Option<CompiledOp> {
         match self.op() {
-            LazyOp::Binary(b) => b.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Cast(c) => c.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Matmul(m) => m.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Softmax(s) => s.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::RoPE(r) => r.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Unary(u) => u.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Reindex(r) => r.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Concat(c) => c.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Norm(n) => n.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Conv(c) => c.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Select(i) => i.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::IndexWrite(i) => i.compile(self, uniform, device, can_inplace).ok(),
-            LazyOp::Cache(c) => c.compile(self, uniform, device, can_inplace).ok(),
+            LazyOp::Binary(b) => b.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Cast(c) => c.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Matmul(m) => m.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Softmax(s) => s.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::RoPE(r) => r.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Unary(u) => u.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Reindex(r) => r.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Concat(c) => c.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Norm(n) => n.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Conv(c) => c.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Select(i) => i.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::IndexWrite(i) => i.compile_gpu(self, uniform, device, can_inplace).ok(),
+            LazyOp::Cache(c) => c.compile_gpu(self, uniform, device, can_inplace).ok(),
             LazyOp::Const => None,
             LazyOp::View(_) => None,
         }
     }
 
     pub fn resolve(self) -> Result<Tensor, TensorError> {
+        match self.device().clone() {
+            Device::GPU(g) => self.resolve_gpu(g),
+            Device::CPU => unimplemented!("CPU backend is not implemented! Help wanted!"),
+            //Device::NPU => self.resolve_npu(),
+        }
+    }
+
+    fn resolve_gpu(self, device: WgpuDevice) -> Result<Tensor, TensorError> {
         let mut uniform = CpuUniform::new();
-        let device = self.device().try_gpu()?;
         device.begin_pass();
 
         let execution_order = self.execution_order();
 
         let mut compiled_ops = Vec::with_capacity(execution_order.len());
-        let mut allocations = device.allocate_cfg(&execution_order, device)?;
-
-        #[cfg(feature = "plotting")]
-        {
-            let last = execution_order.last().unwrap();
-            crate::plot::render_to_file(last, "pre-alloc.svg").unwrap();
-        }
+        let mut allocations = device.allocate_cfg(&execution_order, &device)?;
 
         for t in execution_order.iter() {
             log::debug!("Compiling: {:?}", t.op().name());
@@ -768,20 +769,15 @@ impl Tensor {
             let to_modify = t.op().srcs()[0];
             let can_inplace = t.op().supports_inplace() && to_modify.strong_count() == 1;
 
-            if let Some(compiled_op) = t.compile(&mut uniform, device, can_inplace) {
+            if let Some(compiled_op) = t.compile_gpu(&mut uniform, &device, can_inplace) {
                 compiled_ops.push(compiled_op);
             } else {
-                log::warn!("No compiled op for {:?}", t.op().name());
+                log::warn!("Compilation failed for operation: {:?}", t.op().name());
             }
         }
-        #[cfg(feature = "plotting")]
-        {
-            let last = execution_order.last().unwrap();
-            crate::plot::render_to_file(last, "alloc.svg").unwrap();
-        }
 
-        let executable = Executable::new(compiled_ops, uniform.into_gpu(device)?);
-        let index = executable.dispatch_operations(device).unwrap();
+        let executable = Executable::new(compiled_ops, uniform.into_gpu(&device)?);
+        let index = executable.dispatch(&device).unwrap();
         device.poll(wgpu::MaintainBase::WaitForSubmissionIndex(index));
         Ok(self)
     }

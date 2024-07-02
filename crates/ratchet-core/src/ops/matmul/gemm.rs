@@ -3,14 +3,14 @@ use half::f16;
 use ratchet_macros::WgslMetadata;
 
 use crate::{
-    gpu::dtype::WgslDType, rvec, Array, BindingMode, BuiltIn, DType, GEMMSpec, InvariantError,
-    KernelElement, KernelSource, Matmul, OperationError, Scalar, Tensor, Vec2, Vec4, WgslFragment,
-    WgslKernelBuilder, WgslPrimitive, WorkgroupSize,
+    gpu::dtype::WgslDType, rvec, wgc, wgs, Array, BindGroupLayoutDescriptor as BGLD, BindingMode,
+    BuiltIn, DType, InvariantError, Kernel, KernelElement, KernelKey, KernelRenderable,
+    KernelSource, Matmul, MatmulSpec, OperationError, Scalar, Strides, Tensor, Vec2, Vec4,
+    WgslFragment, WgslKernelBuilder, WgslPrimitive, WorkgroupCount, WorkgroupSize, Workload,
 };
 use glam::IVec3;
 use inline_wgsl::wgsl;
 
-#[derive(Debug, Clone)]
 pub struct GEMM {
     lhs: Tensor,
     rhs: Tensor,
@@ -18,10 +18,11 @@ pub struct GEMM {
     trans_lhs: bool,
     trans_rhs: bool,
     trans_out: bool,
+    spec: MatmulSpec,
 }
 
-impl From<Matmul> for GEMM {
-    fn from(matmul: Matmul) -> Self {
+impl GEMM {
+    pub fn from_matmul(matmul: &Matmul, spec: MatmulSpec) -> Self {
         let Matmul {
             lhs,
             rhs,
@@ -29,14 +30,15 @@ impl From<Matmul> for GEMM {
             trans_lhs,
             trans_rhs,
             trans_out,
-        } = matmul;
-        GEMM {
+        } = matmul.clone();
+        Self {
             lhs,
             rhs,
             bias,
             trans_lhs,
             trans_rhs,
             trans_out,
+            spec,
         }
     }
 }
@@ -53,6 +55,223 @@ pub struct GEMMMeta {
     dimAOuter: i32,
     dimBOuter: i32,
     dimInner: i32,
+}
+
+impl KernelRenderable for GEMM {
+    fn register_bindings<P: WgslPrimitive>(
+        &self,
+        builder: &mut WgslKernelBuilder,
+        _: bool,
+    ) -> Result<(), OperationError> {
+        let (A, _, bias) = (&self.lhs, &self.rhs, &self.bias);
+
+        let float_arr = Array::<P>::default();
+
+        let ro = BindingMode::ReadOnly;
+        match A.dt() {
+            DType::F32 | DType::F16 => {
+                builder.register_storage("A", ro, float_arr);
+                builder.register_storage("B", ro, float_arr);
+                if bias.is_some() {
+                    builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
+                }
+                builder.register_storage("result", BindingMode::ReadWrite, float_arr);
+            }
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
+                builder.register_storage("A", ro, Array::<Scalar<u32>>::default());
+                builder.register_storage("scale", ro, float_arr);
+                builder.register_storage("B", ro, Array::<Scalar<P::T>>::default());
+                if bias.is_some() {
+                    builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
+                }
+                builder.register_storage("result", BindingMode::ReadWrite, float_arr);
+            }
+            _ => return Err(InvariantError::UnsupportedDType(A.dt()).into()),
+        }
+
+        builder.register_uniform();
+        Ok(())
+    }
+
+    fn render<P: WgslPrimitive>(
+        &self,
+        inplace: bool,
+        dst: &Tensor,
+        workgroup_size: &WorkgroupSize,
+    ) -> Result<KernelSource, OperationError> {
+        let device = dst.device().try_gpu()?;
+        let mut kernel_builder = WgslKernelBuilder::new(
+            workgroup_size.clone(),
+            rvec![
+                BuiltIn::GlobalInvocationId,
+                BuiltIn::LocalInvocationId,
+                BuiltIn::WorkgroupId
+            ],
+            device.compute_features().clone(),
+        );
+        self.register_bindings::<P>(&mut kernel_builder, inplace)
+            .unwrap();
+        kernel_builder.render_metadata(&self.metadata(dst, &self.kernel_element(dst))?);
+        self.write_indexing::<P>(&mut kernel_builder);
+        self.write_getters::<P>(dst, &mut kernel_builder)?;
+        self.write_readers_and_writers::<P>(&mut kernel_builder, self.spec.tile_fit())?;
+        if P::W == 1 {
+            self.render_scalar::<P>(kernel_builder)
+        } else {
+            self.render_vectorized::<P>(kernel_builder)
+        }
+    }
+}
+
+impl Kernel for GEMM {
+    type Metadata = GEMMMeta;
+
+    fn kernel_name(&self) -> String {
+        "gemm".to_string()
+    }
+
+    fn kernel_key(
+        &self,
+        workgroup_size: &WorkgroupSize,
+        inplace: bool,
+        srcs: &[&Tensor],
+        dst: &Tensor,
+        kernel_element: &KernelElement,
+    ) -> KernelKey {
+        let (a_fit, b_fit, out_fit) = self.spec.tile_fit();
+        let bias_key = if self.bias.is_some() { "bias" } else { "" };
+
+        let additional = format!(
+            "{}_{}_{}_{}_{}_{}_{}",
+            if a_fit { "" } else { "a_checked" },
+            if b_fit { "" } else { "b_checked" },
+            if out_fit { "" } else { "out_checked" },
+            if self.trans_lhs { "trans_a" } else { "" },
+            if self.trans_rhs { "trans_b" } else { "" },
+            if self.trans_out { "trans_out" } else { "" },
+            bias_key
+        );
+
+        KernelKey::new(
+            &self.kernel_name(),
+            srcs,
+            dst,
+            workgroup_size,
+            inplace,
+            kernel_element,
+            Some(&additional),
+        )
+    }
+
+    fn metadata(&self, _: &Tensor, _: &KernelElement) -> Result<Self::Metadata, OperationError> {
+        let spec = &self.spec;
+        let mut lhs_shape = spec.lhs_shape.clone();
+        lhs_shape.insert(0, spec.lhs_stack());
+        let aStrides = Strides::from(&lhs_shape);
+
+        let mut rhs_shape = spec.rhs_shape.clone();
+        rhs_shape.insert(0, spec.rhs_stack());
+        let bStrides = Strides::from(&rhs_shape);
+
+        let mut out_shape = spec.out_shape.clone();
+        out_shape.insert(0, spec.stacks());
+        let outStrides = Strides::from(&out_shape);
+
+        let dimAOuter = spec.dim_lhs_outer() as i32;
+        let dimBOuter = spec.dim_rhs_outer() as i32;
+        let dimInner = spec.dim_inner() as i32;
+
+        Ok(GEMMMeta {
+            aShape: lhs_shape.into(),
+            aStrides: aStrides.into(),
+            bShape: rhs_shape.into(),
+            bStrides: bStrides.into(),
+            outShape: out_shape.into(),
+            outStrides: outStrides.into(),
+            dimAOuter,
+            dimBOuter,
+            dimInner,
+        })
+    }
+
+    fn calculate_dispatch(&self, _: &Tensor) -> Result<crate::Workload, OperationError> {
+        //GEMM
+        let TILE_DIM = 32;
+        let lhs_shape = self.spec.lhs_shape();
+        let rhs_shape = self.spec.rhs_shape();
+
+        let dimA = if self.trans_lhs {
+            lhs_shape[1]
+        } else {
+            lhs_shape[0]
+        };
+
+        let dimB = if self.trans_rhs {
+            rhs_shape[0]
+        } else {
+            rhs_shape[1]
+        };
+
+        let group_x = WorkgroupCount::div_ceil(dimB as _, TILE_DIM);
+        let div_ceil = WorkgroupCount::div_ceil(dimA, TILE_DIM);
+        let group_y = div_ceil;
+        let workgroup_count = wgc![group_x as _, group_y as _, self.spec.stacks() as _];
+
+        Ok(Workload {
+            workgroup_count,
+            workgroup_size: wgs![8, 8, 1],
+        })
+    }
+
+    fn build_kernel(
+        &self,
+        inplace: bool,
+        dst: &Tensor,
+        workgroup_size: &WorkgroupSize,
+    ) -> Result<KernelSource, OperationError> {
+        let kernel_element = self.spec.select_kernel_element();
+        match (self.lhs.dt(), kernel_element) {
+            (DType::F32, KernelElement::Scalar) => {
+                self.render::<Scalar<f32>>(inplace, dst, workgroup_size)
+            }
+            (DType::F32, KernelElement::Vec2) => {
+                self.render::<Vec2<f32>>(inplace, dst, workgroup_size)
+            }
+            (DType::F32, KernelElement::Vec4) => {
+                self.render::<Vec4<f32>>(inplace, dst, workgroup_size)
+            }
+            (DType::F16, KernelElement::Scalar) => {
+                self.render::<Scalar<f16>>(inplace, dst, workgroup_size)
+            }
+            (DType::F16, KernelElement::Vec2) => {
+                self.render::<Vec2<f16>>(inplace, dst, workgroup_size)
+            }
+            (DType::F16, KernelElement::Vec4) => {
+                self.render::<Vec4<f16>>(inplace, dst, workgroup_size)
+            }
+            (DType::Q8_0F(_), _) => self.render::<Scalar<f32>>(inplace, dst, workgroup_size),
+            (DType::Q8_0H(_), _) => self.render::<Scalar<f16>>(inplace, dst, workgroup_size),
+            (DType::Q4_KF(_), _) => self.render::<Scalar<f32>>(inplace, dst, workgroup_size),
+            (DType::Q4_KH(_), _) => self.render::<Scalar<f16>>(inplace, dst, workgroup_size),
+            _ => Err(InvariantError::UnsupportedDType(self.lhs.dt()).into()),
+        }
+    }
+
+    fn kernel_element(&self, _: &Tensor) -> KernelElement {
+        self.spec.select_kernel_element()
+    }
+
+    fn storage_bind_group_layout(&self, _inplace: bool) -> Result<BGLD, OperationError> {
+        let (LHS, RHS, bias) = (&self.lhs, &self.rhs, &self.bias);
+        let layout = match (LHS.dt(), RHS.dt(), bias.is_some()) {
+            (DType::F32 | DType::F16, DType::F32 | DType::F16, false) => BGLD::binary(),
+            (DType::F32 | DType::F16, DType::F32 | DType::F16, true) => BGLD::ternary(),
+            (DType::Q8_0F(_) | DType::Q8_0H(_), DType::F32 | DType::F16, false) => BGLD::ternary(),
+            (DType::Q8_0F(_) | DType::Q8_0H(_), DType::F32 | DType::F16, true) => BGLD::nthary(4),
+            _ => return Err(InvariantError::UnsupportedDType(RHS.dt()).into()),
+        };
+        Ok(layout)
+    }
 }
 
 impl GEMM {
@@ -91,6 +310,7 @@ impl GEMM {
         let (A, _, _) = (&self.lhs, &self.rhs, &self.bias);
         let accessor = P::render_type();
         let W = P::W;
+        let dt = P::T::DT;
         builder.write_unpack(A.dt());
 
         let a_getters = match A.dt() {
@@ -101,25 +321,13 @@ impl GEMM {
                     }
                 }
             }
-            DType::Q8_0F(_) => {
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
                 wgsl! {
-                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<f32> {
+                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<'dt> {
                         return unpack(A[getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 4]);
                     }
 
-                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> f32 {
-                        let abs_index = getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 32;
-                        return scale[abs_index];
-                    }
-                }
-            }
-            DType::Q8_0H(_) => {
-                wgsl! {
-                    fn getA(d0 : i32, d1 : i32, d2 : i32) -> vec4<f16> {
-                        return unpack(A[getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 4]);
-                    }
-
-                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> f16 {
+                    fn getAbsMax(d0 : i32, d1 : i32, d2 : i32) -> 'dt {
                         let abs_index = getAIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 32;
                         return scale[abs_index];
                     }
@@ -137,17 +345,10 @@ impl GEMM {
                     }
                 });
             }
-            DType::Q8_0F(_) => {
+            DType::Q8_0F(_) | DType::Q8_0H(_) => {
                 builder.write_global(wgsl! {
-                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> f32 {
-                        return f32(B[getBIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 'W]);
-                    }
-                });
-            }
-            DType::Q8_0H(_) => {
-                builder.write_global(wgsl! {
-                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> f16 {
-                        return f16(B[getBIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 'W]);
+                    fn getB(d0 : i32, d1 : i32, d2 : i32) -> 'dt {
+                        return 'dt(B[getBIndexFromCoords3D(vec3<i32>(d0,d1,d2)) / 'W]);
                     }
                 });
             }
@@ -258,92 +459,12 @@ impl GEMM {
         Ok(())
     }
 
-    fn register_bindings<P: WgslPrimitive>(
-        &self,
-        builder: &mut WgslKernelBuilder,
-        _: bool,
-    ) -> Result<(), OperationError> {
-        let (A, _, bias) = (&self.lhs, &self.rhs, &self.bias);
-
-        let float_arr = Array::<P>::default();
-
-        let ro = BindingMode::ReadOnly;
-        match A.dt() {
-            DType::F32 | DType::F16 => {
-                builder.register_storage("A", ro, float_arr);
-                builder.register_storage("B", ro, float_arr);
-                if bias.is_some() {
-                    builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
-                }
-                builder.register_storage("result", BindingMode::ReadWrite, float_arr);
-            }
-            DType::Q8_0F(_) => {
-                builder.register_storage("A", ro, Array::<Scalar<u32>>::default());
-                builder.register_storage("scale", ro, float_arr);
-                builder.register_storage("B", ro, Array::<Scalar<f32>>::default());
-                if bias.is_some() {
-                    builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
-                }
-                builder.register_storage("result", BindingMode::ReadWrite, float_arr);
-            }
-            DType::Q8_0H(_) => {
-                builder.register_storage("A", ro, Array::<Scalar<u32>>::default());
-                builder.register_storage("scale", ro, float_arr);
-                builder.register_storage("B", ro, Array::<Scalar<f16>>::default());
-                if bias.is_some() {
-                    builder.register_storage("bias", BindingMode::ReadOnly, float_arr);
-                }
-                builder.register_storage("result", BindingMode::ReadWrite, float_arr);
-            }
-            _ => return Err(InvariantError::UnsupportedDType(A.dt()).into()),
-        }
-
-        builder.register_uniform();
-        Ok(())
-    }
-
-    pub fn build_kernel(
-        &self,
-        inplace: bool,
-        dst: &Tensor,
-        workgroup_size: &WorkgroupSize,
-        spec: GEMMSpec,
-    ) -> Result<KernelSource, OperationError> {
-        let kernel_element = spec.select_kernel_element();
-        match (self.lhs.dt(), kernel_element) {
-            (DType::F32, KernelElement::Scalar) => {
-                self.build_gemm::<Scalar<f32>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::F32, KernelElement::Vec2) => {
-                self.build_gemm::<Vec2<f32>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::F32, KernelElement::Vec4) => {
-                self.build_gemm::<Vec4<f32>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::F16, KernelElement::Scalar) => {
-                self.build_gemm::<Scalar<f16>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::F16, KernelElement::Vec2) => {
-                self.build_gemm::<Vec2<f16>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::F16, KernelElement::Vec4) => {
-                self.build_gemm::<Vec4<f16>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::Q8_0F(_), _) => {
-                self.build_gemm::<Scalar<f32>>(inplace, dst, workgroup_size, spec)
-            }
-            (DType::Q8_0H(_), _) => {
-                self.build_gemm::<Scalar<f16>>(inplace, dst, workgroup_size, spec)
-            }
-            _ => panic!("Unsupported dtype"),
-        }
-    }
-
-    fn build_gemm_scalar<P: WgslPrimitive>(
+    fn render_scalar<P: WgslPrimitive>(
         &self,
         mut kernel_builder: WgslKernelBuilder,
     ) -> Result<KernelSource, OperationError> {
         const ROW_PER_THREAD: usize = 4;
+        const COL_PER_THREAD: usize = 4;
         const TILE_DIM: usize = 32;
 
         let accessor = P::render_type();
@@ -360,7 +481,7 @@ impl GEMM {
             let batchA = batch % metadata.aShape[0];
             let batchB = batch % metadata.bShape[0];
 
-            let tileRow = i32(local_invocation_id.y) * 4;
+            let tileRow = i32(local_invocation_id.y) * 'ROW_PER_THREAD;
             let tileCol = i32(local_invocation_id.x) * 4;
 
             let globalRowStart = i32(workgroup_id.y) * 'T_W;
@@ -491,7 +612,7 @@ impl GEMM {
         Ok(kernel_builder.build()?)
     }
 
-    fn build_gemm_vectorized<P: WgslPrimitive>(
+    fn render_vectorized<P: WgslPrimitive>(
         &self,
         mut kernel_builder: WgslKernelBuilder,
     ) -> Result<KernelSource, OperationError> {
@@ -623,35 +744,5 @@ impl GEMM {
 
         let x = kernel_builder.build()?;
         Ok(x)
-    }
-
-    fn build_gemm<P: WgslPrimitive>(
-        &self,
-        inplace: bool,
-        dst: &Tensor,
-        workgroup_size: &WorkgroupSize,
-        spec: GEMMSpec,
-    ) -> Result<KernelSource, OperationError> {
-        let device = self.lhs.device().try_gpu().unwrap();
-        let mut kernel_builder = WgslKernelBuilder::new(
-            workgroup_size.clone(),
-            rvec![
-                BuiltIn::GlobalInvocationId,
-                BuiltIn::LocalInvocationId,
-                BuiltIn::WorkgroupId
-            ],
-            device.compute_features().clone(),
-        );
-        self.register_bindings::<P>(&mut kernel_builder, inplace)
-            .unwrap();
-        kernel_builder.write_metadata::<GEMMMeta>();
-        self.write_indexing::<P>(&mut kernel_builder);
-        self.write_getters::<P>(dst, &mut kernel_builder)?;
-        self.write_readers_and_writers::<P>(&mut kernel_builder, spec.tile_fit())?;
-        if P::W == 1 {
-            self.build_gemm_scalar::<P>(kernel_builder)
-        } else {
-            self.build_gemm_vectorized::<P>(kernel_builder)
-        }
     }
 }

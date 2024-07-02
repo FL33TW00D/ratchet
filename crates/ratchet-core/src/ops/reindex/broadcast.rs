@@ -1,6 +1,18 @@
 use derive_new::new;
+use encase::ShaderType;
+use ratchet_macros::WgslMetadata;
 
-use crate::{OpGuards, Operation, OperationError, Shape, StorageView, Strides, Tensor};
+use crate::{rvec, OpGuards, Operation, OperationError, RVec, Shape, StorageView, Strides, Tensor};
+
+#[derive(Debug, WgslMetadata, ShaderType, derive_new::new)]
+pub struct BroadcastMeta {
+    src_shape: glam::UVec4,
+    dst_shape: glam::UVec4,
+    src_stride: glam::UVec4,
+    dst_stride: glam::UVec4,
+    src_numel: u32,
+    dst_numel: u32,
+}
 
 #[derive(new, Debug, Clone)]
 pub struct Broadcast {
@@ -16,12 +28,42 @@ impl Broadcast {
 
 impl OpGuards for Broadcast {
     //TODO: check the broadcast is valid
-    fn check_shapes(&self) {}
+    fn check_shapes(&self) {
+        let src_shape = self.src.shape();
+        let to_shape = &self.to;
 
-    fn check_dtypes(&self) {}
+        let sr = src_shape.rank();
+        let dr = to_shape.rank();
+        if sr > dr {
+            panic!(
+                "Source shape cannot have more dimensions than target shape: {} > {}",
+                sr, dr
+            );
+        }
+
+        let src_iter = src_shape.iter().rev();
+        let to_iter = to_shape.iter().rev();
+
+        for (src_dim, to_dim) in src_iter.zip(to_iter) {
+            if *src_dim != 1 && *src_dim != *to_dim {
+                panic!(
+                    "Invalid broadcast: source dimension {} cannot be broadcast to {}",
+                    src_dim, to_dim
+                );
+            }
+        }
+    }
+
+    fn check_dtypes(&self) {
+        assert!(!self.src.dt().is_quantized());
+    }
 }
 
 impl Operation for Broadcast {
+    fn name(&self) -> &'static str {
+        "Broadcast"
+    }
+
     //For rules, see https://numpy.org/doc/stable/user/basics.broadcasting.html
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         let src_shape = self.src.shape();
@@ -32,6 +74,10 @@ impl Operation for Broadcast {
 
         let strides = Strides::from(&self.to);
         Ok(StorageView::new(self.to.clone(), self.src.dt(), strides))
+    }
+
+    fn srcs(&self) -> RVec<&Tensor> {
+        rvec![&self.src]
     }
 }
 

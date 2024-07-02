@@ -1,6 +1,20 @@
+use encase::ShaderType;
+use ratchet_macros::WgslMetadata;
+
 use crate::{prelude::*, OpGuards, OperationError, StorageView, Strides};
 use crate::{Operation, RVec};
 use std::ops::Range;
+
+#[derive(Debug, WgslMetadata, ShaderType, derive_new::new)]
+pub struct SliceMeta {
+    src_shape: glam::UVec4,
+    dst_shape: glam::UVec4,
+    src_stride: glam::UVec4,
+    dst_stride: glam::UVec4,
+    src_numel: u32,
+    dst_numel: u32,
+    src_offsets: glam::UVec4,
+}
 
 /// # Slice
 ///
@@ -34,6 +48,10 @@ impl OpGuards for Slice {
 }
 
 impl Operation for Slice {
+    fn name(&self) -> &'static str {
+        "Slice"
+    }
+
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         let output_shape = self
             .indices
@@ -43,6 +61,10 @@ impl Operation for Slice {
             .into();
         let strides = Strides::from(&output_shape);
         Ok(StorageView::new(output_shape, self.src.dt(), strides))
+    }
+
+    fn srcs(&self) -> RVec<&Tensor> {
+        rvec![&self.src]
     }
 }
 

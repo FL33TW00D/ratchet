@@ -21,11 +21,9 @@ pub enum ExecutionError {
 }
 
 impl Executable {
+    /// Dispatch operations to the hardware.
     #[cfg(not(feature = "gpu-profiling"))]
-    pub fn dispatch_operations(
-        &self,
-        device: &WgpuDevice,
-    ) -> Result<SubmissionIndex, ExecutionError> {
+    pub fn dispatch(&self, device: &WgpuDevice) -> Result<SubmissionIndex, ExecutionError> {
         let pipeline_resources = device.pipeline_resources();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

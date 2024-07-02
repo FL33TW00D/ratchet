@@ -1,7 +1,6 @@
 use std::io::{BufRead, Seek};
 
-use half::f16;
-use ratchet::{prelude::shape, rvec, DType, Device, Tensor};
+use ratchet::{prelude::shape, rvec, Device, Tensor};
 use ratchet_loader::gguf::gguf::Header;
 use ratchet_nn::{KVEntry, Linear, Module, RotaryEmbedding, RotaryInput};
 

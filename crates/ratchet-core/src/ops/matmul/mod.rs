@@ -1,12 +1,20 @@
+mod gemm;
+mod quantized;
+mod subgroup_gemv;
+mod workgroup_gemv;
+
+pub use gemm::*;
+pub use quantized::*;
+pub use subgroup_gemv::*;
+pub use workgroup_gemv::*;
+
 use std::cmp::Ordering;
 
-use encase::ShaderType;
-
 use crate::{
-    gpu::{BindGroupLayoutDescriptor, CpuUniform, WorkgroupCount},
-    rvec, wgc, wgs, DType, InvariantError, KernelElement, KernelKey, KernelSource, MetaOperation,
-    OpGuards, OpMetadata, Operation, OperationError, RVec, Shape, StorageView, Strides,
-    SubgroupGEMVMeta, Tensor, WorkgroupGEMVMeta, WorkgroupSize, Workload, GEMM, GEMV, Q8_0F, Q8_0H,
+    gpu::{BindGroupLayoutDescriptor, CpuUniform},
+    rvec, DType, GPUOperation, Kernel, KernelElement, KernelKey, KernelMetadata, KernelRenderable,
+    KernelSource, OpGuards, Operation, OperationError, RVec, Shape, StorageView, Strides, Tensor,
+    WorkgroupSize, Workload, Q4_KF, Q4_KH, Q8_0F, Q8_0H,
 };
 
 //https://link.springer.com/chapter/10.1007/978-3-642-29737-3_42
@@ -19,6 +27,15 @@ pub enum GEMVHeuristic {
 }
 
 impl GEMVHeuristic {
+    pub fn new(arows: usize, acols: usize) -> Self {
+        match (arows, acols) {
+            (arows, acols) if arows > acols * 4 => GEMVHeuristic::VeryTall,
+            (arows, acols) if arows > acols * 2 => GEMVHeuristic::Tall,
+            (arows, acols) if acols > arows * 2 => GEMVHeuristic::Fat,
+            _ => GEMVHeuristic::Square,
+        }
+    }
+
     pub fn as_workgroup_size(&self) -> (usize, usize) {
         match self {
             GEMVHeuristic::Fat => (4, 256),
@@ -29,7 +46,7 @@ impl GEMVHeuristic {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct GEMMSpec {
+pub struct MatmulSpec {
     lhs_dt: DType,
     rhs_dt: DType,
     lhs_shape: Shape,
@@ -42,25 +59,24 @@ pub struct GEMMSpec {
     trans_rhs: bool,
     trans_out: bool,
     stack_shape: Shape, //N-D matmul is handled by stacking the first N-2 dimensions
-    pub heuristic: GEMVHeuristic, //TODO: split this
+    pub heuristic: GEMVHeuristic,
 }
 
-impl GEMMSpec {
-    //TODO: variable tiles
-    pub const TILE_DIM: usize = 32;
+impl MatmulSpec {
     pub const ROW_PER_THREAD: usize = 4;
+    pub const TILE_DIM: usize = 32;
 
     pub fn new(
         LHS: &Tensor,
         RHS: &Tensor,
-        OUT: &Tensor,
         trans_lhs: bool,
         trans_rhs: bool,
         trans_out: bool,
     ) -> Self {
         let mut lhs_shape = LHS.shape().clone();
         let mut rhs_shape = RHS.shape().clone();
-        let mut c_shape = OUT.shape().clone();
+        let mut c_shape =
+            Matmul::compute_c_shape(LHS, RHS, trans_lhs, trans_rhs, trans_out).unwrap();
         let a_dt = LHS.dt();
         let rhs_dt = RHS.dt();
 
@@ -77,8 +93,6 @@ impl GEMMSpec {
             }
             _ => {}
         };
-
-        let _b_rank = rhs_shape.rank();
 
         let stack_dims = c_shape.rank() - 2;
         let stack_shape = c_shape.slice(0..stack_dims);
@@ -109,12 +123,7 @@ impl GEMMSpec {
             stack_shape.numel(),
         );
 
-        let heuristic = match (lhs_shape[0], lhs_shape[1]) {
-            (arows, acols) if arows > acols * 4 => GEMVHeuristic::VeryTall,
-            (arows, acols) if arows > acols * 2 => GEMVHeuristic::Tall,
-            (arows, acols) if acols > arows * 2 => GEMVHeuristic::Fat,
-            _ => GEMVHeuristic::Square,
-        };
+        let heuristic = GEMVHeuristic::new(lhs_shape[0], lhs_shape[1]);
 
         Self {
             lhs_dt: a_dt,
@@ -244,7 +253,7 @@ impl GEMMSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(derive_new::new, Debug, Clone)]
 pub struct Matmul {
     pub(crate) lhs: Tensor,
     pub(crate) rhs: Tensor,
@@ -255,32 +264,6 @@ pub struct Matmul {
 }
 
 impl Matmul {
-    pub fn new(
-        lhs: Tensor,
-        rhs: Tensor,
-        bias: Option<Tensor>,
-        trans_lhs: bool,
-        trans_rhs: bool,
-        trans_out: bool,
-    ) -> Self {
-        if !bias.as_ref().map_or(true, |b| b.shape().is_vector()) {
-            panic!("Bias must be a vector: {:?}", bias);
-        }
-
-        if lhs.dt().is_quantized() && trans_lhs {
-            panic!("Transposed quantized inputs are not supported");
-        }
-
-        Self {
-            lhs,
-            rhs,
-            bias,
-            trans_lhs,
-            trans_rhs,
-            trans_out,
-        }
-    }
-
     pub fn compute_c_shape(
         a: &Tensor,
         b: &Tensor,
@@ -360,11 +343,10 @@ impl Matmul {
         Ok(c_shape_final)
     }
 
-    pub fn compute_spec(&self, dst: &Tensor) -> GEMMSpec {
-        GEMMSpec::new(
+    pub fn compute_spec(&self) -> MatmulSpec {
+        MatmulSpec::new(
             &self.lhs,
             &self.rhs,
-            dst,
             self.trans_lhs,
             self.trans_rhs,
             self.trans_out,
@@ -372,59 +354,11 @@ impl Matmul {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[derive(Debug, Clone, ShaderType)]
-pub struct MatmulMeta {
-    aShape: glam::IVec3,
-    aStrides: glam::IVec3,
-    bShape: glam::IVec3,
-    bStrides: glam::IVec3,
-    outShape: glam::IVec3,
-    outStrides: glam::IVec3,
-    dimAOuter: i32,
-    dimBOuter: i32,
-    dimInner: i32,
-}
-
-impl MatmulMeta {
-    pub(crate) fn write_metadata(
-        uniform: &mut CpuUniform,
-        spec: &GEMMSpec,
-    ) -> Result<u64, OperationError> {
-        let mut lhs_shape = spec.lhs_shape.clone();
-        lhs_shape.insert(0, spec.lhs_stack());
-        let aStrides = Strides::from(&lhs_shape);
-
-        let mut rhs_shape = spec.rhs_shape.clone();
-        rhs_shape.insert(0, spec.rhs_stack());
-        let bStrides = Strides::from(&rhs_shape);
-
-        let mut out_shape = spec.out_shape.clone();
-        out_shape.insert(0, spec.stacks());
-        let outStrides = Strides::from(&out_shape);
-
-        let dimAOuter = spec.dim_lhs_outer() as i32;
-        let dimBOuter = spec.dim_rhs_outer() as i32;
-        let dimInner = spec.dim_inner() as i32;
-
-        let meta = MatmulMeta {
-            aShape: lhs_shape.into(),
-            aStrides: aStrides.into(),
-            bShape: rhs_shape.into(),
-            bStrides: bStrides.into(),
-            outShape: out_shape.into(),
-            outStrides: outStrides.into(),
-            dimAOuter,
-            dimBOuter,
-            dimInner,
-        };
-        Ok(uniform.write(&meta)?)
-    }
-}
-
-impl OpMetadata for MatmulMeta {}
-
 impl Operation for Matmul {
+    fn name(&self) -> &'static str {
+        "Matmul"
+    }
+
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         let c_shape = Matmul::compute_c_shape(
             &self.lhs,
@@ -436,6 +370,14 @@ impl Operation for Matmul {
         .unwrap();
         let c_strides = Strides::from(&c_shape);
         Ok(StorageView::new(c_shape, self.rhs.dt(), c_strides))
+    }
+
+    fn srcs(&self) -> RVec<&Tensor> {
+        if let Some(bias) = &self.bias {
+            rvec![&self.lhs, &self.rhs, bias]
+        } else {
+            rvec![&self.lhs, &self.rhs]
+        }
     }
 }
 
@@ -457,18 +399,22 @@ impl OpGuards for Matmul {
             (DType::F16, DType::F16),
             (DType::Q8_0F(Q8_0F::default()), DType::F32),
             (DType::Q8_0H(Q8_0H::default()), DType::F16),
+            (DType::Q4_KF(Q4_KF::default()), DType::F32),
+            (DType::Q4_KH(Q4_KH::default()), DType::F16),
         ];
+
         if !allowed_pairs.contains(&(self.lhs.dt(), self.rhs.dt())) {
             panic!(
-                "Failed to validate DTypes: {:?}, {:?}",
+                "DType mismatch: lhs: {:?}, rhs: {:?}",
                 self.lhs.dt(),
                 self.rhs.dt()
             );
         }
+
         if let Some(bias) = &self.bias {
             if bias.dt() != self.rhs.dt() {
                 panic!(
-                    "Failed to validate DTypes: bias {:?}, rhs {:?}",
+                    "DType mismatch: bias: {:?}, rhs: {:?}",
                     bias.dt(),
                     self.rhs.dt()
                 );
@@ -477,155 +423,141 @@ impl OpGuards for Matmul {
     }
 }
 
-impl MetaOperation for Matmul {
-    fn kernel_name(&self) -> String {
-        "GEMM".to_string()
+/// Encapsulate all metadata structs for underlying kernels
+pub enum MatmulMeta {
+    GEMMMeta(GEMMMeta),
+    SubgroupGEMVMeta(SubgroupGEMVMeta),
+    WorkgroupGEMVMeta(WorkgroupGEMVMeta),
+    Quantized(QuantizedMeta),
+}
+
+impl KernelMetadata for MatmulMeta {
+    fn render_meta(&self) -> crate::WgslFragment {
+        match self {
+            MatmulMeta::GEMMMeta(meta) => meta.render_meta(),
+            MatmulMeta::SubgroupGEMVMeta(meta) => meta.render_meta(),
+            MatmulMeta::WorkgroupGEMVMeta(meta) => meta.render_meta(),
+            MatmulMeta::Quantized(meta) => meta.render_meta(),
+        }
     }
+
+    fn write(&self, uniform: &mut CpuUniform) -> Result<u64, OperationError> {
+        match self {
+            MatmulMeta::GEMMMeta(meta) => meta.write(uniform),
+            MatmulMeta::SubgroupGEMVMeta(meta) => meta.write(uniform),
+            MatmulMeta::WorkgroupGEMVMeta(meta) => meta.write(uniform),
+            MatmulMeta::Quantized(meta) => meta.write(uniform),
+        }
+    }
+}
+
+pub enum MatmulKernels {
+    GEMM(GEMM),
+    SubgroupGEMV(SubgroupGEMV),
+    WorkgroupGEMV(WorkgroupGEMV),
+    Quantized(Quantized),
+}
+
+impl KernelRenderable for MatmulKernels {
+    fn register_bindings<P: crate::WgslPrimitive>(
+        &self,
+        builder: &mut crate::WgslKernelBuilder,
+        inplace: bool,
+    ) -> Result<(), OperationError> {
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.register_bindings::<P>(builder, inplace),
+            MatmulKernels::SubgroupGEMV(kernel) => kernel.register_bindings::<P>(builder, inplace),
+            MatmulKernels::WorkgroupGEMV(kernel) => kernel.register_bindings::<P>(builder, inplace),
+            MatmulKernels::Quantized(kernel) => kernel.register_bindings::<P>(builder, inplace),
+        }
+    }
+
+    fn render<P: crate::WgslPrimitive>(
+        &self,
+        inplace: bool,
+        dst: &Tensor,
+        workgroup_size: &WorkgroupSize,
+    ) -> Result<KernelSource, OperationError> {
+        match self {
+            MatmulKernels::GEMM(k) => k.render::<P>(inplace, dst, workgroup_size),
+            MatmulKernels::SubgroupGEMV(k) => k.render::<P>(inplace, dst, workgroup_size),
+            MatmulKernels::WorkgroupGEMV(k) => k.render::<P>(inplace, dst, workgroup_size),
+            MatmulKernels::Quantized(k) => k.render::<P>(inplace, dst, workgroup_size),
+        }
+    }
+}
+
+/// Defer down to kernel level
+impl Kernel for MatmulKernels {
+    type Metadata = MatmulMeta;
 
     fn kernel_key(
         &self,
         workgroup_size: &WorkgroupSize,
         inplace: bool,
+        srcs: &[&Tensor],
         dst: &Tensor,
         kernel_element: &KernelElement,
     ) -> KernelKey {
-        let spec = self.compute_spec(dst);
-        let device = dst.device().try_gpu().unwrap();
-        let kernel_stem = if spec.is_gemv() { "gemv" } else { "gemm" };
-        let subgroup = if spec.is_gemv() && device.compute_features().SUBGROUP {
-            "subgroup"
-        } else {
-            ""
-        };
-        let (a_fit, b_fit, out_fit) = spec.tile_fit();
-        let bias_key = if self.bias.is_some() { "bias" } else { "" };
-
-        let additional = format!(
-            "{}_{}_{}_{}_{}_{}_{}_{}",
-            if a_fit { "" } else { "a_checked" },
-            if b_fit { "" } else { "b_checked" },
-            if out_fit { "" } else { "out_checked" },
-            if self.trans_lhs { "trans_a" } else { "" },
-            if self.trans_rhs { "trans_b" } else { "" },
-            if self.trans_out { "trans_out" } else { "" },
-            subgroup,
-            bias_key
-        );
-
-        KernelKey::new(
-            kernel_stem,
-            &self.srcs(),
-            dst,
-            workgroup_size,
-            inplace,
-            kernel_element,
-            Some(&additional),
-        )
+        match self {
+            MatmulKernels::GEMM(kernel) => {
+                kernel.kernel_key(workgroup_size, inplace, srcs, dst, kernel_element)
+            }
+            MatmulKernels::SubgroupGEMV(kernel) => {
+                kernel.kernel_key(workgroup_size, inplace, srcs, dst, kernel_element)
+            }
+            MatmulKernels::WorkgroupGEMV(kernel) => {
+                kernel.kernel_key(workgroup_size, inplace, srcs, dst, kernel_element)
+            }
+            MatmulKernels::Quantized(kernel) => {
+                kernel.kernel_key(workgroup_size, inplace, srcs, dst, kernel_element)
+            }
+        }
     }
 
-    fn srcs(&self) -> RVec<&Tensor> {
-        if let Some(bias) = &self.bias {
-            rvec![&self.lhs, &self.rhs, bias]
-        } else {
-            rvec![&self.lhs, &self.rhs]
+    fn kernel_name(&self) -> String {
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.kernel_name(),
+            MatmulKernels::SubgroupGEMV(kernel) => kernel.kernel_name(),
+            MatmulKernels::WorkgroupGEMV(kernel) => kernel.kernel_name(),
+            MatmulKernels::Quantized(kernel) => kernel.kernel_name(),
+        }
+    }
+
+    fn metadata(
+        &self,
+        dst: &Tensor,
+        kernel_element: &KernelElement,
+    ) -> Result<Self::Metadata, OperationError> {
+        match self {
+            MatmulKernels::GEMM(k) => Ok(MatmulMeta::GEMMMeta(k.metadata(dst, kernel_element)?)),
+            MatmulKernels::SubgroupGEMV(k) => Ok(MatmulMeta::SubgroupGEMVMeta(
+                k.metadata(dst, kernel_element)?,
+            )),
+            MatmulKernels::WorkgroupGEMV(k) => Ok(MatmulMeta::WorkgroupGEMVMeta(
+                k.metadata(dst, kernel_element)?,
+            )),
+            MatmulKernels::Quantized(k) => {
+                Ok(MatmulMeta::Quantized(k.metadata(dst, kernel_element)?))
+            }
+        }
+    }
+
+    fn calculate_dispatch(&self, dst: &Tensor) -> Result<Workload, OperationError> {
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.calculate_dispatch(dst),
+            MatmulKernels::SubgroupGEMV(kernel) => kernel.calculate_dispatch(dst),
+            MatmulKernels::WorkgroupGEMV(kernel) => kernel.calculate_dispatch(dst),
+            MatmulKernels::Quantized(kernel) => kernel.calculate_dispatch(dst),
         }
     }
 
     fn kernel_element(&self, dst: &Tensor) -> KernelElement {
-        let spec = self.compute_spec(dst);
-        spec.select_kernel_element()
-    }
-
-    //TODO: clean
-    fn calculate_dispatch(&self, dst: &Tensor) -> Result<Workload, OperationError> {
-        let spec = self.compute_spec(dst);
-
-        if spec.rhs_shape().is_vector() && !self.trans_lhs {
-            //GEMV
-            let device = self.lhs.device().try_gpu().unwrap();
-            if device.compute_features().SUBGROUP {
-                Ok(Workload {
-                    workgroup_count: wgc![
-                        ((spec.new_dim_lhs_outer() / 32) + 1) as _,
-                        1,
-                        spec.stacks() as _
-                    ],
-                    workgroup_size: wgs![32, 8, 1],
-                })
-            } else {
-                //GEMV workgroup style
-                let (TX, TY) = spec.heuristic.as_workgroup_size();
-                let group_x = WorkgroupCount::div_ceil(spec.lhs_shape()[0], TX);
-
-                Ok(Workload {
-                    workgroup_count: wgc![group_x as _, 1, spec.stacks() as _],
-                    workgroup_size: wgs![TX as _, TY as _, 1],
-                })
-            }
-        } else {
-            //GEMM
-            let TILE_DIM = 32;
-            let lhs_shape = spec.lhs_shape();
-            let rhs_shape = spec.rhs_shape();
-
-            let dimA = if self.trans_lhs {
-                lhs_shape[1]
-            } else {
-                lhs_shape[0]
-            };
-
-            let dimB = if self.trans_rhs {
-                rhs_shape[0]
-            } else {
-                rhs_shape[1]
-            };
-
-            let group_x = WorkgroupCount::div_ceil(dimB as _, TILE_DIM);
-            let group_y = WorkgroupCount::div_ceil(dimA, TILE_DIM);
-            let workgroup_count = wgc![group_x as _, group_y as _, spec.stacks() as _];
-
-            Ok(Workload {
-                workgroup_count,
-                workgroup_size: wgs![8, 8, 1],
-            })
-        }
-    }
-
-    fn storage_bind_group_layout(
-        &self,
-        _inplace: bool,
-    ) -> Result<BindGroupLayoutDescriptor, OperationError> {
-        let (LHS, RHS, bias) = (&self.lhs, &self.rhs, &self.bias);
-        let layout = match (LHS.dt(), RHS.dt(), bias.is_some()) {
-            (DType::F32, DType::F32, false) => BindGroupLayoutDescriptor::binary(),
-            (DType::F32, DType::F32, true) => BindGroupLayoutDescriptor::ternary(),
-            (DType::F16, DType::F16, false) => BindGroupLayoutDescriptor::binary(),
-            (DType::F16, DType::F16, true) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0F(_), DType::F32, false) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0H(_), DType::F16, false) => BindGroupLayoutDescriptor::ternary(),
-            (DType::Q8_0F(_), DType::F32, true) => BindGroupLayoutDescriptor::nthary(4),
-            (DType::Q8_0H(_), DType::F16, true) => BindGroupLayoutDescriptor::nthary(4),
-            _ => return Err(InvariantError::UnsupportedDType(RHS.dt()).into()),
-        };
-        Ok(layout)
-    }
-
-    fn write_metadata(
-        &self,
-        uniform: &mut CpuUniform,
-        dst: &Tensor,
-        _: &KernelElement,
-    ) -> Result<u64, OperationError> {
-        let spec = self.compute_spec(dst);
-        if spec.is_gemv() {
-            let device = dst.device().try_gpu().unwrap();
-            if device.compute_features().SUBGROUP {
-                SubgroupGEMVMeta::write_metadata(uniform, &spec)
-            } else {
-                WorkgroupGEMVMeta::write_metadata(uniform, &spec)
-            }
-        } else {
-            MatmulMeta::write_metadata(uniform, &spec)
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.kernel_element(dst),
+            MatmulKernels::SubgroupGEMV(kernel) => kernel.kernel_element(dst),
+            MatmulKernels::WorkgroupGEMV(kernel) => kernel.kernel_element(dst),
+            MatmulKernels::Quantized(kernel) => kernel.kernel_element(dst),
         }
     }
 
@@ -635,13 +567,61 @@ impl MetaOperation for Matmul {
         dst: &Tensor,
         workgroup_size: &WorkgroupSize,
     ) -> Result<KernelSource, OperationError> {
-        let spec = self.compute_spec(dst);
-        if spec.is_gemv() {
-            let gemv: GEMV = self.clone().into();
-            gemv.build_kernel(inplace, dst, workgroup_size, spec)
-        } else {
-            let gemm: GEMM = self.clone().into();
-            gemm.build_kernel(inplace, dst, workgroup_size, spec)
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.build_kernel(inplace, dst, workgroup_size),
+            MatmulKernels::SubgroupGEMV(k) => k.build_kernel(inplace, dst, workgroup_size),
+            MatmulKernels::WorkgroupGEMV(k) => k.build_kernel(inplace, dst, workgroup_size),
+            MatmulKernels::Quantized(kernel) => kernel.build_kernel(inplace, dst, workgroup_size),
+        }
+    }
+
+    fn storage_bind_group_layout(
+        &self,
+        inplace: bool,
+    ) -> Result<BindGroupLayoutDescriptor, OperationError> {
+        match self {
+            MatmulKernels::GEMM(kernel) => kernel.storage_bind_group_layout(inplace),
+            MatmulKernels::SubgroupGEMV(kernel) => kernel.storage_bind_group_layout(inplace),
+            MatmulKernels::WorkgroupGEMV(kernel) => kernel.storage_bind_group_layout(inplace),
+            MatmulKernels::Quantized(kernel) => kernel.storage_bind_group_layout(inplace),
+        }
+    }
+}
+
+impl GPUOperation for Matmul {
+    type KernelEnum = MatmulKernels;
+
+    fn select_kernel(&self) -> Self::KernelEnum {
+        if !self.bias.as_ref().map_or(true, |b| b.shape().is_vector()) {
+            panic!("Bias must be a vector: {:?}", self.bias);
+        }
+
+        if self.lhs.dt().is_quantized() && self.trans_lhs {
+            panic!("Transposed quantized inputs are not supported");
+        }
+
+        let is_gemv = self.rhs.shape().is_vector() && !self.trans_lhs;
+        let is_q4 = self.lhs.dt().is_q4();
+        let supports_subgroup = self
+            .lhs
+            .device()
+            .try_gpu()
+            .unwrap()
+            .compute_features()
+            .SUBGROUP;
+
+        let spec = self.compute_spec();
+
+        match (is_gemv, is_q4, supports_subgroup) {
+            (true, false, true) => {
+                MatmulKernels::SubgroupGEMV(SubgroupGEMV::from_matmul(self, spec))
+            }
+            (true, false, false) => {
+                MatmulKernels::WorkgroupGEMV(WorkgroupGEMV::from_matmul(self, spec))
+            }
+            (false, true, _) => MatmulKernels::Quantized(Quantized::from_matmul(self, spec)),
+            (false, false, _) => MatmulKernels::GEMM(GEMM::from_matmul(self, spec)),
+            _ => todo!(),
         }
     }
 }
@@ -805,6 +785,7 @@ def matmul(a, b{}):
         } else {
             None
         };
+
         println!("LHS shape: {:?}", lhs_shape);
         println!("RHS shape: {:?}", rhs_shape);
         println!("Bias: {:?}", bias.as_ref().map(|b| b.shape()));
@@ -856,11 +837,11 @@ def matmul(a, b{}):
         let _ = env_logger::builder().is_test(true).try_init();
         let device = GPU_DEVICE.with(|d| d.clone());
         let cpu_device = Device::request_device(DeviceRequest::CPU)?;
-        let a = Tensor::randn::<f32>(shape![2, 222, 252], cpu_device.clone());
-        let b = Tensor::randn::<f32>(shape![1, 222, 238], cpu_device.clone());
-        let bias = Some(Tensor::randn::<f32>(shape![238], cpu_device.clone()));
+        let a = Tensor::randn::<f32>(shape![2, 175, 241], cpu_device.clone());
+        let b = Tensor::randn::<f32>(shape![2, 241, 182], cpu_device.clone());
+        let bias = Some(Tensor::randn::<f32>(shape![182], cpu_device.clone()));
 
-        let TRANS_LHS = true;
+        let TRANS_LHS = false;
         let TRANS_RHS = false;
         let TRANS_OUT = false;
         let QUANT = false;

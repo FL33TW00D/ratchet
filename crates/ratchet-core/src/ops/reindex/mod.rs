@@ -3,20 +3,21 @@ mod permute;
 mod slice;
 
 pub use broadcast::Broadcast;
+use broadcast::BroadcastMeta;
 use half::f16;
 pub use permute::Permute;
-use ratchet_macros::WgslMetadata;
+use permute::PermuteMeta;
 pub use slice::Slice;
 
 use derive_new::new;
-use encase::ShaderType;
 use inline_wgsl::wgsl;
+use slice::SliceMeta;
 
 use crate::{
     gpu::{BindGroupLayoutDescriptor, CpuUniform},
-    rvec, Array, BindingMode, BuiltIn, DType, KernelElement, KernelSource, MetaOperation,
-    OperationError, RVec, Scalar, Shape, Strides, Tensor, WgslKernelBuilder, WgslPrimitive,
-    WorkgroupSize, Workload,
+    rvec, Array, BindingMode, BuiltIn, DType, GPUOperation, Kernel, KernelElement, KernelMetadata,
+    KernelRenderable, KernelSource, OpGuards, Operation, OperationError, RVec, Scalar, Shape,
+    Strides, Tensor, WgslKernelBuilder, WgslPrimitive, WorkgroupSize, Workload,
 };
 use glam::UVec4;
 
@@ -27,7 +28,11 @@ pub enum Reindex {
     Broadcast(Broadcast),
 }
 
-impl Reindex {
+pub enum ReindexKernels {
+    Standard(Reindex),
+}
+
+impl KernelRenderable for ReindexKernels {
     fn register_bindings<P: WgslPrimitive>(
         &self,
         builder: &mut WgslKernelBuilder,
@@ -40,7 +45,7 @@ impl Reindex {
         Ok(())
     }
 
-    fn build_reindex<P: WgslPrimitive>(
+    fn render<P: WgslPrimitive>(
         &self,
         inplace: bool,
         dst: &Tensor,
@@ -57,8 +62,7 @@ impl Reindex {
             device.compute_features().clone(),
         );
         self.register_bindings::<P>(&mut kernel_builder, inplace)?;
-        //In future this metadata could be dynamic
-        kernel_builder.write_metadata::<ReindexMeta>();
+        kernel_builder.render_metadata(&self.metadata(dst, &self.kernel_element(dst))?);
 
         let n = P::W;
 
@@ -87,7 +91,9 @@ impl Reindex {
 
         });
 
-        let body = match self {
+        let ReindexKernels::Standard(inner) = self;
+
+        let body = match inner {
             Reindex::Permute(_) => wgsl! {
                 var src_index = vec4<u32>(0u);
                 src_index[metadata.perm[0]] = dst_index[0];
@@ -103,9 +109,14 @@ impl Reindex {
         };
         kernel_builder.write_main(body);
 
+        let src_offsets = match inner {
+            Reindex::Slice(_) => wgsl! { metadata.src_offsets },
+            _ => wgsl! { vec4<u32>(0u) },
+        };
+
         kernel_builder.write_main(wgsl! {
             //Convert 4D index into 1D offset
-            let src_offset = ndIndexToOffset(src_index, metadata.src_offsets, metadata.src_stride);
+            let src_offset = ndIndexToOffset(src_index, 'src_offsets, metadata.src_stride);
             //Read from input buffer and write to output buffer
             Y[dst_offset] = X[src_offset];
         });
@@ -113,33 +124,12 @@ impl Reindex {
     }
 }
 
-#[derive(Debug, ShaderType, WgslMetadata)]
-pub struct ReindexMeta {
-    src_shape: glam::UVec4,
-    dst_shape: glam::UVec4,
-    src_stride: glam::UVec4,
-    dst_stride: glam::UVec4,
-    src_numel: u32,
-    dst_numel: u32,
-    //"Optional" fields below (if not present, they are set to 0) this is dumb
-    perm: glam::UVec4,
-    src_offsets: glam::UVec4,
-}
+impl Kernel for ReindexKernels {
+    type Metadata = ReindexMeta;
 
-impl MetaOperation for Reindex {
     fn kernel_name(&self) -> String {
         match self {
-            Reindex::Permute(_) => "permute".to_string(),
-            Reindex::Slice(_) => "slice".to_string(),
-            Reindex::Broadcast(_) => "broadcast".to_string(),
-        }
-    }
-
-    fn srcs(&self) -> RVec<&Tensor> {
-        match self {
-            Reindex::Permute(p) => rvec![&p.src],
-            Reindex::Slice(s) => rvec![&s.src],
-            Reindex::Broadcast(b) => rvec![&b.src],
+            ReindexKernels::Standard(reindex) => reindex.name().to_string(),
         }
     }
 
@@ -151,21 +141,31 @@ impl MetaOperation for Reindex {
         Ok(Workload::std(dst.shape().numel(), self.kernel_element(dst)))
     }
 
-    fn storage_bind_group_layout(
+    fn build_kernel(
         &self,
-        _inplace: bool,
-    ) -> Result<BindGroupLayoutDescriptor, OperationError> {
-        Ok(BindGroupLayoutDescriptor::unary())
+        inplace: bool,
+        dst: &Tensor,
+        workgroup_size: &WorkgroupSize,
+    ) -> Result<KernelSource, OperationError> {
+        let kernel_element = self.kernel_element(dst);
+        match (dst.dt(), &kernel_element) {
+            (DType::F32, KernelElement::Scalar) => {
+                self.render::<Scalar<f32>>(inplace, dst, workgroup_size)
+            }
+            (DType::F16, KernelElement::Scalar) => {
+                self.render::<Scalar<f16>>(inplace, dst, workgroup_size)
+            }
+            _ => Err(OperationError::CompileError(format!(
+                "Unsupported dtype {:?} or kernel element {:?}",
+                dst.dt(),
+                kernel_element
+            ))),
+        }
     }
 
-    fn write_metadata(
-        &self,
-        uniform: &mut CpuUniform,
-        dst: &Tensor,
-        _: &KernelElement,
-    ) -> Result<u64, OperationError> {
-        //This is gross
-        let srcs = self.srcs();
+    fn metadata(&self, dst: &Tensor, _: &KernelElement) -> Result<Self::Metadata, OperationError> {
+        let ReindexKernels::Standard(inner) = self;
+        let srcs = inner.srcs();
         let src = srcs.first().unwrap();
         let src_shape = Shape::promote(src.shape().clone(), 4);
         let dst_shape = Shape::promote(dst.shape().clone(), 4);
@@ -182,17 +182,21 @@ impl MetaOperation for Reindex {
         let src_shape = UVec4::from(&src_shape);
         let dst_shape = UVec4::from(&dst_shape);
 
-        //TODO: move this to the inner ops
-        //TODO: this is incredibly bad
-        let permute = match &self {
+        match inner {
             Reindex::Permute(p) => {
-                let dims = p.promote();
-                let vdims = dims.iter().map(|&d| d as u32).collect::<Vec<_>>();
-                vdims.try_into().unwrap()
+                let permute = p.promote();
+                let vdims = permute.iter().map(|&d| d as u32).collect::<Vec<_>>();
+                let perm: [u32; 4] = vdims.try_into().unwrap();
+                Ok(ReindexMeta::Permute(PermuteMeta::new(
+                    src_shape,
+                    dst_shape,
+                    src_stride,
+                    dst_stride,
+                    src_numel,
+                    dst_numel,
+                    perm.into(),
+                )))
             }
-            _ => [0, 0, 0, 0],
-        };
-        let src_offsets = match &self {
             Reindex::Slice(s) => {
                 let starts = s.indices().iter().map(|i| i.start).collect::<Vec<_>>();
                 let mut offsets = [0; 4];
@@ -200,44 +204,103 @@ impl MetaOperation for Reindex {
                 for (i, &start) in starts.iter().enumerate() {
                     offsets[i + offset] = start as u32;
                 }
-                offsets
+                let src_offsets = UVec4::from(offsets);
+                Ok(ReindexMeta::Slice(SliceMeta::new(
+                    src_shape,
+                    dst_shape,
+                    src_stride,
+                    dst_stride,
+                    src_numel,
+                    dst_numel,
+                    src_offsets,
+                )))
             }
-            _ => [0, 0, 0, 0],
-        };
-        let perm = glam::UVec4::from(permute);
-        let src_offsets = glam::UVec4::from(src_offsets);
-        let meta = ReindexMeta {
-            src_shape,
-            dst_shape,
-            src_stride,
-            dst_stride,
-            src_numel,
-            dst_numel,
-            perm,
-            src_offsets,
-        };
-        Ok(uniform.write(&meta)?)
-    }
-
-    fn build_kernel(
-        &self,
-        inplace: bool,
-        dst: &Tensor,
-        workgroup_size: &WorkgroupSize,
-    ) -> Result<KernelSource, OperationError> {
-        let kernel_element = self.kernel_element(dst);
-        match (dst.dt(), &kernel_element) {
-            (DType::F32, KernelElement::Scalar) => {
-                self.build_reindex::<Scalar<f32>>(inplace, dst, workgroup_size)
-            }
-            (DType::F16, KernelElement::Scalar) => {
-                self.build_reindex::<Scalar<f16>>(inplace, dst, workgroup_size)
-            }
-            _ => Err(OperationError::CompileError(format!(
-                "Unsupported dtype {:?} or kernel element {:?}",
-                dst.dt(),
-                kernel_element
+            Reindex::Broadcast(_) => Ok(ReindexMeta::Broadcast(BroadcastMeta::new(
+                src_shape, dst_shape, src_stride, dst_stride, src_numel, dst_numel,
             ))),
         }
+    }
+
+    fn storage_bind_group_layout(
+        &self,
+        _inplace: bool,
+    ) -> Result<BindGroupLayoutDescriptor, OperationError> {
+        Ok(BindGroupLayoutDescriptor::unary())
+    }
+}
+
+pub enum ReindexMeta {
+    Permute(PermuteMeta),
+    Slice(SliceMeta),
+    Broadcast(BroadcastMeta),
+}
+
+impl KernelMetadata for ReindexMeta {
+    fn render_meta(&self) -> crate::WgslFragment {
+        match self {
+            ReindexMeta::Permute(p) => p.render_meta(),
+            ReindexMeta::Slice(s) => s.render_meta(),
+            ReindexMeta::Broadcast(b) => b.render_meta(),
+        }
+    }
+
+    fn write(&self, uniform: &mut CpuUniform) -> Result<u64, OperationError> {
+        match self {
+            ReindexMeta::Permute(p) => p.write(uniform),
+            ReindexMeta::Slice(s) => s.write(uniform),
+            ReindexMeta::Broadcast(b) => b.write(uniform),
+        }
+    }
+}
+
+impl OpGuards for Reindex {
+    fn check_shapes(&self) {
+        match self {
+            Reindex::Permute(p) => p.check_shapes(),
+            Reindex::Slice(s) => s.check_shapes(),
+            Reindex::Broadcast(b) => b.check_shapes(),
+        }
+    }
+
+    fn check_dtypes(&self) {
+        match self {
+            Reindex::Permute(p) => p.check_dtypes(),
+            Reindex::Slice(s) => s.check_dtypes(),
+            Reindex::Broadcast(b) => b.check_dtypes(),
+        }
+    }
+}
+
+impl Operation for Reindex {
+    fn name(&self) -> &'static str {
+        match self {
+            Reindex::Permute(_) => "Permute",
+            Reindex::Slice(_) => "Slice",
+            Reindex::Broadcast(_) => "Broadcast",
+        }
+    }
+
+    fn compute_view(&self) -> Result<crate::StorageView, OperationError> {
+        match self {
+            Reindex::Permute(p) => p.compute_view(),
+            Reindex::Slice(s) => s.compute_view(),
+            Reindex::Broadcast(b) => b.compute_view(),
+        }
+    }
+
+    fn srcs(&self) -> RVec<&Tensor> {
+        match self {
+            Reindex::Permute(p) => p.srcs(),
+            Reindex::Slice(s) => s.srcs(),
+            Reindex::Broadcast(b) => b.srcs(),
+        }
+    }
+}
+
+impl GPUOperation for Reindex {
+    type KernelEnum = ReindexKernels;
+
+    fn select_kernel(&self) -> Self::KernelEnum {
+        ReindexKernels::Standard(self.clone())
     }
 }

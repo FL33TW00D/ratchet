@@ -1,4 +1,4 @@
-use crate::{gpu::*, DType, MetaOperation, Tensor, TensorId};
+use crate::{gpu::*, DType, Tensor, TensorId};
 use rustc_hash::FxHashMap;
 use std::{borrow::Cow, sync::Arc};
 use wgpu::{Adapter, Limits};
@@ -222,17 +222,17 @@ impl WgpuDevice {
         Ok(self.compute_pipeline_pool.get_or_create(desc, self))
     }
 
-    pub fn get_or_create_compute_module<O: MetaOperation + ?Sized>(
+    pub fn get_or_create_compute_module<K: Kernel + ?Sized>(
         &self,
         desc: &KernelModuleDesc,
-        op: &O,
+        kernel: &K,
         inplace: bool,
         dst: &Tensor,
         workgroup_size: &WorkgroupSize,
         device: &WgpuDevice,
     ) -> KernelModuleHandle {
         self.kernel_module_pool
-            .get_or_create(desc, op, inplace, dst, workgroup_size, device)
+            .get_or_create(desc, kernel, inplace, dst, workgroup_size, device)
     }
 
     pub fn kernel_module_resources(

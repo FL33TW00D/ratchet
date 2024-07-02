@@ -5,10 +5,10 @@ use inline_wgsl::wgsl;
 use ratchet_macros::WgslMetadata;
 
 use crate::{
-    gpu::{dtype::WgslDType, BindGroupLayoutDescriptor, CpuUniform},
-    rvec, wgc, wgs, Array, BindingMode, BuiltIn, DType, KernelElement, KernelSource, MetaOperation,
-    OpGuards, Operation, OperationError, RVec, Scalar, StorageView, Tensor, Vec2, Vec4,
-    WgslKernelBuilder, WgslPrimitive, WorkgroupSize, Workload,
+    gpu::{dtype::WgslDType, BindGroupLayoutDescriptor},
+    rvec, wgc, wgs, Array, BindingMode, BuiltIn, DType, GPUOperation, Kernel, KernelElement,
+    KernelRenderable, KernelSource, OpGuards, Operation, OperationError, RVec, Scalar, StorageView,
+    Tensor, Vec2, Vec4, WgslKernelBuilder, WgslPrimitive, WorkgroupSize, Workload,
 };
 
 #[derive(new, Debug, Clone)]
@@ -38,7 +38,7 @@ impl OpGuards for Softmax {
     }
 }
 
-impl Softmax {
+impl KernelRenderable for SoftmaxKernels {
     fn register_bindings<P: WgslPrimitive>(
         &self,
         builder: &mut WgslKernelBuilder,
@@ -52,16 +52,13 @@ impl Softmax {
         Ok(())
     }
 
-    fn build_softmax<P: WgslPrimitive>(
+    fn render<P: WgslPrimitive>(
         &self,
         inplace: bool,
-        _: &Tensor,
+        dst: &Tensor,
         workgroup_size: &WorkgroupSize,
-    ) -> Result<KernelSource, OperationError>
-    where
-        P::T: num_traits::Float,
-    {
-        let device = self.input.device().try_gpu().unwrap();
+    ) -> Result<KernelSource, OperationError> {
+        let device = dst.device().try_gpu()?;
         let mut kernel_builder = WgslKernelBuilder::new(
             workgroup_size.clone(),
             rvec![
@@ -72,7 +69,7 @@ impl Softmax {
             device.compute_features().clone(),
         );
         self.register_bindings::<P>(&mut kernel_builder, inplace)?;
-        kernel_builder.write_metadata::<SoftmaxMeta>();
+        kernel_builder.render_metadata(&self.metadata(dst, &self.kernel_element(dst))?);
 
         let dt = P::T::DT;
         let accessor = P::render_type();
@@ -184,14 +181,12 @@ impl Softmax {
 }
 
 impl Operation for Softmax {
+    fn name(&self) -> &'static str {
+        "Softmax"
+    }
+
     fn compute_view(&self) -> Result<StorageView, OperationError> {
         Ok(self.input.storage_view().clone())
-    }
-}
-
-impl MetaOperation for Softmax {
-    fn kernel_name(&self) -> String {
-        "softmax".to_string()
     }
 
     fn srcs(&self) -> RVec<&Tensor> {
@@ -201,10 +196,23 @@ impl MetaOperation for Softmax {
     fn supports_inplace(&self) -> bool {
         true
     }
+}
+
+impl Kernel for SoftmaxKernels {
+    type Metadata = SoftmaxMeta;
+
+    fn kernel_name(&self) -> String {
+        match self {
+            Self::Standard(_) => String::from("softmax"),
+        }
+    }
 
     fn kernel_element(&self, _dst: &Tensor) -> KernelElement {
-        let input = &self.input;
-        let N = input.shape()[self.dim] as u32;
+        let inner = match self {
+            Self::Standard(op) => op,
+        };
+        let input = &inner.input;
+        let N = input.shape()[inner.dim] as u32;
         if N % 4 == 0 {
             KernelElement::Vec4
         } else if N % 2 == 0 {
@@ -221,42 +229,57 @@ impl MetaOperation for Softmax {
         workgroup_size: &WorkgroupSize,
     ) -> Result<KernelSource, OperationError> {
         let kernel_element = self.kernel_element(dst);
-        match (self.input.dt(), &kernel_element) {
+        match (dst.dt(), &kernel_element) {
             (DType::F32, KernelElement::Scalar) => {
-                self.build_softmax::<Scalar<f32>>(inplace, dst, workgroup_size)
+                self.render::<Scalar<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F32, KernelElement::Vec2) => {
-                self.build_softmax::<Vec2<f32>>(inplace, dst, workgroup_size)
+                self.render::<Vec2<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F32, KernelElement::Vec4) => {
-                self.build_softmax::<Vec4<f32>>(inplace, dst, workgroup_size)
+                self.render::<Vec4<f32>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Scalar) => {
-                self.build_softmax::<Scalar<f16>>(inplace, dst, workgroup_size)
+                self.render::<Scalar<f16>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Vec2) => {
-                self.build_softmax::<Vec2<f16>>(inplace, dst, workgroup_size)
+                self.render::<Vec2<f16>>(inplace, dst, workgroup_size)
             }
             (DType::F16, KernelElement::Vec4) => {
-                self.build_softmax::<Vec4<f16>>(inplace, dst, workgroup_size)
+                self.render::<Vec4<f16>>(inplace, dst, workgroup_size)
             }
             _ => Err(OperationError::CompileError(format!(
                 "Unsupported dtype {:?} or kernel element {:?}",
-                self.input.dt(),
+                dst.dt(),
                 kernel_element
             ))),
         }
     }
 
     fn calculate_dispatch(&self, _dst: &Tensor) -> Result<Workload, OperationError> {
+        let inner = match self {
+            Self::Standard(op) => op,
+        };
         let workgroup_size = wgs![128, 1, 1];
-        let input = &self.input;
-        let stacks = input.shape().slice(0..self.dim - 1).numel();
-        let M = input.shape()[self.dim - 1] as u32;
+        let input = &inner.input;
+        let stacks = input.shape().slice(0..inner.dim - 1).numel();
+        let M = input.shape()[inner.dim - 1] as u32;
         Ok(Workload {
             workgroup_size,
             workgroup_count: wgc![M as _, stacks as _, 1],
         })
+    }
+
+    fn metadata(&self, _: &Tensor, _: &KernelElement) -> Result<Self::Metadata, OperationError> {
+        let inner = match self {
+            Self::Standard(op) => op,
+        };
+        let input = &inner.input;
+        let M = input.shape()[inner.dim - 1] as u32;
+        let N = input.shape()[inner.dim] as u32;
+        let ND2 = N / 2;
+        let ND4 = N / 4;
+        Ok(SoftmaxMeta { M, N, ND2, ND4 })
     }
 
     fn storage_bind_group_layout(
@@ -268,20 +291,19 @@ impl MetaOperation for Softmax {
         }
         Ok(BindGroupLayoutDescriptor::unary_inplace())
     }
+}
 
-    fn write_metadata(
-        &self,
-        uniform: &mut CpuUniform,
-        _: &Tensor,
-        _: &KernelElement,
-    ) -> Result<u64, OperationError> {
-        let input = &self.input;
-        let M = input.shape()[self.dim - 1] as u32;
-        let N = input.shape()[self.dim] as u32;
-        let ND2 = N / 2;
-        let ND4 = N / 4;
-        let meta = SoftmaxMeta { M, N, ND2, ND4 };
-        Ok(uniform.write(&meta)?)
+pub enum SoftmaxKernels {
+    Standard(Softmax),
+}
+
+impl GPUOperation for Softmax {
+    type KernelEnum = SoftmaxKernels;
+
+    fn select_kernel(&self) -> Self::KernelEnum {
+        match self {
+            Self { .. } => SoftmaxKernels::Standard(self.clone()),
+        }
     }
 }
 
@@ -290,8 +312,7 @@ mod tests {
     use test_strategy::{proptest, Arbitrary};
 
     use crate::test_util::run_py_prg;
-    use crate::{shape, wgs, Device, DeviceRequest, MetaOperation, Softmax, Tensor};
-    use half::f16;
+    use crate::{shape, Device, DeviceRequest, Tensor};
 
     thread_local! {
         static GPU_DEVICE: Device = Device::request_device(DeviceRequest::GPU).unwrap();
@@ -343,15 +364,5 @@ def softmax(a):
     fn dbg_softmax() {
         let problem = SoftmaxProblem { B: 1, M: 2, N: 128 };
         run_softmax_trial(problem);
-    }
-
-    #[test]
-    fn test_render_softmax() {
-        let device = GPU_DEVICE.with(|d| d.clone());
-        let a = Tensor::randn::<f16>(shape![1, 2, 128], device.clone());
-        let dst = Tensor::zeros::<f16>(&shape![1, 2, 128], &device);
-        let op = Softmax::new(a, 2);
-        let wgs = wgs![128, 1, 1];
-        let _ = op.build_kernel(true, &dst, &wgs);
     }
 }

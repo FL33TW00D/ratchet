@@ -6,7 +6,7 @@ use super::dtype::GGUFInterop;
 use crate::{error::Result, GgmlDType};
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use ratchet::{Device, Shape, Tensor, Q8_0F, Q8_0H};
+use ratchet::{Device, Shape, Tensor, Q4_KF, Q4_KH, Q8_0F, Q8_0H};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -130,9 +130,23 @@ pub fn ratchet_from_gguf(
         GgmlDType::Q8_0 => match device {
             Device::GPU(gpu) => {
                 if gpu.compute_features().SHADER_F16 {
+                    log::info!("Device supports F16, loading Q8_0 with F16");
                     from_raw_data::<Q8_0H>(raw_data, size_in_bytes, shape, device)
                 } else {
+                    log::info!("Device does not support F16, loading Q8_0 with F32");
                     from_raw_data::<Q8_0F>(raw_data, size_in_bytes, shape, device)
+                }
+            }
+            _ => panic!("Loading from GGUF -> Ratchet using CPU device, no way of knowing if F16 is supported"),
+        },
+        GgmlDType::Q4K => match device {
+            Device::GPU(gpu) => {
+                if gpu.compute_features().SHADER_F16 {
+                    log::info!("Device supports F16, loading Q4K with F16");
+                    from_raw_data::<Q4_KH>(raw_data, size_in_bytes, shape, device)
+                } else {
+                    log::info!("Device does not support F16, loading Q4K with F32");
+                    from_raw_data::<Q4_KF>(raw_data, size_in_bytes, shape, device)
                 }
             }
             _ => panic!("Loading from GGUF -> Ratchet using CPU device, no way of knowing if F16 is supported"),

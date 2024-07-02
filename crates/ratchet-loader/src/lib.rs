@@ -140,3 +140,38 @@ impl GgmlDType {
         numel * self.type_size() / self.block_numel()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::gguf::gguf::Header;
+    use half::f16;
+    use ratchet::{shape, Device, DeviceRequest, Tensor};
+
+    #[test]
+    fn test_q4_dequant() -> anyhow::Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let model_path = "../../fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+        let mut reader = std::io::BufReader::new(std::fs::File::open(model_path)?);
+        let device = Device::request_device(DeviceRequest::GPU)?;
+        let content = Header::read(&mut reader)?;
+        let t = content.tensor(&mut reader, "blk.0.attn_k.weight", &device)?;
+
+        let rhs = Tensor::randn::<f16>(shape![2048, 2048], device.clone());
+        let out = t.matmul(rhs, false, false)?.resolve()?;
+        let out_cpu = out.to(&Device::CPU)?;
+
+        println!("{:#?}", out_cpu);
+
+        let ground = "../../fixtures/tinyllama_blk_0_attn_k_weight_f32.npy";
+        let ground_t = Tensor::read_npy::<f32, _>(ground, &device)?
+            .half()?
+            .resolve()?
+            .to(&Device::CPU)?;
+
+        println!("{:#?}", ground_t);
+
+        //out_cpu.all_close(&ground_t, f16::from_f32(1e-3), f16::from_f32(1e-3))?;
+
+        Ok(())
+    }
+}
